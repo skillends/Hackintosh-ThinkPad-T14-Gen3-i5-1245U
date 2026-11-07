@@ -27,6 +27,17 @@ Ao tirar o cabo, o `GMBUS2` ficava preso (`0x8200`, `0x8a00`) e nem STOP nem res
 sucessos. A última operação registrada era uma escrita do driver da Apple no endereço `0x74` (HDCP). Ao responder a
 esse endereço sem tocar no barramento, o `lightups` passou a 2, a imagem voltou e não houve mais recuperações.
 
+### Boot sem cabo
+
+Depois dessa correção, o boot sem cabo travou: o AUX do eDP (`ddi = 0`) deu cerca de 720 timeouts,
+`FB0: Failed to read EDID 0xe00002d6`, e a tela interna não acendeu. Com o cabo, nenhum timeout. Boots anteriores, que
+parecem ter sido feitos sem cabo, não tinham a falha. O único código novo que dependia do cabo era a resposta imediata
+do GMBUS com HPD baixo.
+
+Essa resposta agora só vale depois de um AUX bom no eDP. No boot seguinte sem cabo foram 0 timeouts, e a recuperação de
+energia também incluída no kext não precisou agir. A ligação exata entre o GMBUS e o AUX do eDP não foi explicada. Um
+travamento geral aos 35 s (`Ticket spinlock`) apareceu em uma das tentativas, sem causa provada.
+
 ## Áudio
 
 - Alto-falante baixo era o volume nos Ajustes, diferente da barra de menus.

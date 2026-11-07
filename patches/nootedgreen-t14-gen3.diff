@@ -12,7 +12,7 @@ index e291589..6b72bc7 100755
  		<string>1.0.0b1</string>
  		<key>com.apple.kpi.bsd</key>
 diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
-index 53d4288..d852f42 100755
+index 53d4288..38ab51e 100755
 --- a/src/NootedGreen/kern_gen11.cpp
 +++ b/src/NootedGreen/kern_gen11.cpp
 @@ -10,6 +10,7 @@ static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
@@ -42,7 +42,67 @@ index 53d4288..d852f42 100755
  // ngreenhdmiregs (27/10): snapshot READ-ONLY de um conjunto fixo de registradores do pipe B (power wells, fuse,
  // DPCLKA/PLL enables, DDI_BUF_CTL_B, TRANS_DDI_FUNC_CTL_B, TRANSCONF_B, PIPE_SRCSZ_B, combo PHY B) lido com
  // NGreen::readReg32 (BAR0) e publicado em ngreen-hdmiregs. Com ngreenhdmiflags=0x202 + ngreenhdmiddc o monitor LG
-@@ -1204,6 +1217,7 @@ static void patchPortModeVtable(KernelPatcher &patcher, size_t index, mach_vm_ad
+@@ -1155,13 +1168,57 @@ static uint32_t xePortModeStub(void *that) {
+ // Stub de runAUXCommand (slot de vtable +0x188), instalado só quando gHdmiAuxKill != 0. Para a porta HDMI
+ // (ddi == gHdmiDdi) devolve na hora, sem esperar o timeout de ~15 ms do hardware: =1 "timeout" (0x5d40023f),
+ // =2 "sucesso" (0). Para o eDP (ddi 0) e qualquer outra porta, é repasse puro para o original.
++// T14: boot sem cabo HDMI deixou o AUX do eDP (ddi 0) em timeout e a tela interna nao acendeu. A trava de HPD baixo em
++// xeHwDoGMBusRequest so vale depois de um AUX bom no eDP. Se o AUX falhar com poco ou DC errado, corrige e repete 1 vez.
++static volatile bool gXeEdpAuxOk = false;
++static volatile UInt32 gXeEdpAuxFails = 0, gXeEdpAuxRecovers = 0, gXeEdpAuxRetryOk = 0;
++static char gXeEdpAuxDiag[200] = {};
+ static uint32_t xeRunAUXStub(void *that, uint32_t cmd, void *p, uint32_t n, uint32_t b) {
++	bool isEdp = false;
+ 	if (gHdmiAuxKill && that) {
+ 		auto *pc = *reinterpret_cast<uint8_t **>(reinterpret_cast<uint8_t *>(that) + 0x548);
+ 		if (pc && *reinterpret_cast<uint32_t *>(pc + 0x0) == gHdmiDdi)
+ 			return gHdmiAuxKill == 2 ? 0u : 0x5d40023fu;
+-	}
+-	return FunctionCast(xeRunAUXStub, gOrgRunAUX)(that, cmd, p, n, b);
++		isEdp = pc && *reinterpret_cast<uint32_t *>(pc + 0x0) == 0;
++	}
++	uint32_t r = FunctionCast(xeRunAUXStub, gOrgRunAUX)(that, cmd, p, n, b);
++	if (!isEdp || !NGreen::callback || NGreen::callback->getIsRealTGL()) return r;
++	if (r == 0) {
++		gXeEdpAuxOk = true;
++		return r;
++	}
++	gXeEdpAuxOk = false;   // o caminho nativo do GMBUS volta enquanto o eDP nao responder
++	const UInt32 f = OSIncrementAtomic(&gXeEdpAuxFails);
++	auto rd = [](uint32_t a) { return NGreen::callback->readReg32(a); };
++	auto wr = [](uint32_t a, uint32_t v) { NGreen::callback->writeReg32(a, v); };
++	const uint32_t dc = rd(0x45504), ctl2 = rd(0x45404), aux2 = rd(0x45444), ddi2 = rd(0x45454);
++	const uint32_t pps = rd(0xC7200), ppc = rd(0xC7204), actl = rd(0x64010);
++	const bool bad = (dc & 0x3u) || (ctl2 & 0xC03u) != 0xC03u || (aux2 & 0x3u) != 0x3u || (ddi2 & 0x3u) != 0x3u;
++	snprintf(gXeEdpAuxDiag, sizeof(gXeEdpAuxDiag),
++			 "fails=%u rec=%u retryok=%u r=0x%x dc=0x%x ctl2=0x%x aux2=0x%x ddi2=0x%x pps=0x%x ppc=0x%x actl=0x%x",
++			 (unsigned)(f + 1), (unsigned)gXeEdpAuxRecovers, (unsigned)gXeEdpAuxRetryOk, r, dc, ctl2, aux2, ddi2, pps, ppc, actl);
++	if (f < 16) IOLog("XeEDP aux %s\n", gXeEdpAuxDiag);
++	if (!bad || OSIncrementAtomic(&gXeEdpAuxRecovers) >= 16) return r;
++	if (dc & 0x3u) {
++		NGreen::callback->dcExit("edpaux");
++		const uint32_t dc2 = rd(0x45504);
++		if (dc2 & 0x3u) wr(0x45504, dc2 & ~0x3u);
++	}
++	if ((ctl2 & 0xC02u) != 0xC02u) wr(0x45404, rd(0x45404) | 0xC02u);
++	if (!(aux2 & 0x2u)) wr(0x45444, rd(0x45444) | 0x2u);
++	if (!(ddi2 & 0x2u)) wr(0x45454, rd(0x45454) | 0x2u);
++	for (int i = 0; i < 100 && ((rd(0x45444) & 0x1u) == 0 || (rd(0x45454) & 0x1u) == 0); i++) IODelay(100);
++	r = FunctionCast(xeRunAUXStub, gOrgRunAUX)(that, cmd, p, n, b);
++	if (r == 0) {
++		gXeEdpAuxOk = true;
++		OSIncrementAtomic(&gXeEdpAuxRetryOk);
++	}
++	snprintf(gXeEdpAuxDiag, sizeof(gXeEdpAuxDiag),
++			 "fails=%u rec=%u retryok=%u r=0x%x antes dc=0x%x ctl2=0x%x aux2=0x%x ddi2=0x%x depois aux2=0x%x ddi2=0x%x pps=0x%x",
++			 (unsigned)gXeEdpAuxFails, (unsigned)gXeEdpAuxRecovers, (unsigned)gXeEdpAuxRetryOk, r, dc, ctl2, aux2, ddi2,
++			 rd(0x45444), rd(0x45454), rd(0xC7200));
++	if (f < 16) IOLog("XeEDP recuperou %s\n", gXeEdpAuxDiag);
++	return r;
+ }
+ // Troca o slot 50 (byte 0x10 do header RTTI + 0x190) da vtable da classe pelo stub, na janela de carga do kext.
+ static void patchPortModeVtable(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+@@ -1204,6 +1261,7 @@ static void patchPortModeVtable(KernelPatcher &patcher, size_t index, mach_vm_ad
  	// mesma forma dos irmãos (valor numérico ou flag "-"). Default 0 => kext idêntico ao que boota.
  	PE_parse_boot_argn("ngreenhdmiddc", &gHdmiDdc, sizeof(gHdmiDdc));
  	if (checkKernelArgument("-ngreenhdmiddc")) gHdmiDdc = 1;
@@ -50,7 +110,7 @@ index 53d4288..d852f42 100755
  	// ngreenhdmiregs (27/10): snapshot read-only dos registradores do pipe B. Opt-in, mesma forma dos irmãos
  	// (valor numérico ou flag "-"). Default 0 => kext idêntico ao que boota (nenhuma leitura extra de MMIO).
  	PE_parse_boot_argn("ngreenhdmiregs", &gHdmiRegs, sizeof(gHdmiRegs));
-@@ -1696,6 +1710,16 @@ static void xeD13LogLong(const char *tag, const char *s) {   // o IOLog corta li
+@@ -1696,6 +1754,17 @@ static void xeD13LogLong(const char *tag, const char *s) {   // o IOLog corta li
  static void xeD13Publish() {
  	IOService *svc = gXeD13Svc;
  	if (!svc) return;
@@ -64,10 +124,11 @@ index 53d4288..d852f42 100755
 +		(int)NGreen::callback->getIsRealTGL());
 +	svc->setProperty("ngreen-hdmi13-init", init);
 +	if (gHdmiGmbusLastNative[0]) svc->setProperty("ngreen-hdmiddc-lastnative", gHdmiGmbusLastNative);
++	svc->setProperty("ngreen-edp-aux", gXeEdpAuxDiag[0] ? gXeEdpAuxDiag : "sem falhas");
  	char sum[200];
  	snprintf(sum, sizeof(sum), "light=%u f10undone=%d held=0x%x pll=%u pipe=%u forces=%u lightups=%u clkon=%u clkoff=%u",
  			 gHdmiLight, (int)gXeD13F10Undone, (unsigned)gXeD13Held, gXeD13Pll, gXeD13Pipe, (unsigned)gXeD13Forces,
-@@ -1786,7 +1810,11 @@ static int xeD13RnuDecision(void *ctrl, void *fb, void *path, const void *ret) {
+@@ -1786,7 +1855,11 @@ static int xeD13RnuDecision(void *ctrl, void *fb, void *path, const void *ret) {
  	if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(ctrl))) gXeD13Svc = svc;
  	xeD13PowerOn(pipe, "rnu");
  	const uint32_t tconf = xeD13Rd(0x70008 + 0x1000 * pipe), buf = xeD13Rd(xeD13DdiBuf());
@@ -80,7 +141,7 @@ index 53d4288..d852f42 100755
  	const UInt32 f = gXeD13Forces;
  	const int d = lit ? -1 : f < 6 ? 1 : 0;
  	if (d == 1) OSIncrementAtomic(&gXeD13Forces);
-@@ -1896,9 +1924,69 @@ static bool xeGmbusWait(uint32_t wantBit, int maxUs) {
+@@ -1896,9 +1969,69 @@ static bool xeGmbusWait(uint32_t wantBit, int maxUs) {
  static char gEdidDiag[120];
  static char gPathDiag[160];
  static char gProbe0[96], gProbe1[112];
@@ -150,7 +211,7 @@ index 53d4288..d852f42 100755
  	wr(0xc5110, 0);                            // GMBUS4: sem interrupção (vamos pollar)
  	wr(0xc5104, 0x80000000);                   // GMBUS1: SW_CLR_INT (limpa estado preso)
  	wr(0xc5104, 0);
-@@ -1920,9 +2008,26 @@ static bool xeReadEdidGmbus(uint32_t pin, uint8_t *buf, uint32_t len) {
+@@ -1920,9 +2053,26 @@ static bool xeReadEdidGmbus(uint32_t pin, uint8_t *buf, uint32_t len) {
  		for (uint32_t b = 0; b < 4 && i + b < len; b++) buf[i + b] = (v >> (8 * b)) & 0xff;
  	}
  	if (okall) st1 = rd(0xc5108);
@@ -180,7 +241,7 @@ index 53d4288..d852f42 100755
  	wr(0xc5100, 0);                       // libera o GMBUS
  	return okall;
  }
-@@ -2121,6 +2226,14 @@ static void xeHotplugHook(void *controller, uint32_t ddi, uint32_t portMode) {
+@@ -2121,6 +2271,16 @@ static void xeHotplugHook(void *controller, uint32_t ddi, uint32_t portMode) {
  				xeHdmiLightUp(svc);
  			}
  		}
@@ -189,13 +250,15 @@ index 53d4288..d852f42 100755
 +			snprintf(recover, sizeof(recover), "recovers=%u ok=%u before=0x%x after=0x%x agora=0x%x",
 +				(unsigned)gHdmiGmbusRecovers, (unsigned)gHdmiGmbusRecoverOk, gHdmiGmbusRecoverBefore,
 +				gHdmiGmbusRecoverAfter, NGreen::callback->readReg32(0xc5108));
-+			if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(controller)))
++			if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(controller))) {
 +				svc->setProperty("ngreen-gmbus-recover", recover);
++				svc->setProperty("ngreen-edp-aux", gXeEdpAuxDiag[0] ? gXeEdpAuxDiag : "sem falhas");
++			}
 +		}
  		if (gHdmiSink && gSinkDiag[0]) {
  			if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(controller)))
  				svc->setProperty("ngreen-sink", gSinkDiag);
-@@ -2215,6 +2328,20 @@ static bool xeConnProbeHook(void *fbv) {
+@@ -2215,6 +2375,20 @@ static bool xeConnProbeHook(void *fbv) {
  //   sub-bloco de escrita seja no máximo UM byte de índice 0. Qualquer payload de escrita real (wcount>1 ou wbyte!=0),
  //   offset!=0, outro slave, contagem>128, outro pino ou display real cai no original SEM alteração (nunca falsificamos).
  static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, void *req) {
@@ -207,7 +270,7 @@ index 53d4288..d852f42 100755
 +		return kIOReturnBusy; // Avoid lock-order stalls; caller can retry.
 +	}
 +	// T14: sem cabo nao ha monitor para ler. Responder na hora evita prender o barramento.
-+	if (gHdmiBaseOnly && gHdmiDdc && bus == gHdmiBus && req && !NGreen::callback->getIsRealTGL() &&
++	if (gHdmiBaseOnly && gHdmiDdc && gXeEdpAuxOk && bus == gHdmiBus && req && !NGreen::callback->getIsRealTGL() &&
 +		!(NGreen::callback->readReg32(0xc4000) & (1u << (16 + gHdmiDdi)))) {
 +		getMember<uint32_t>(req, 0x1c) = kIOReturnNotResponding;
 +		if (NGreen::callback->readReg32(0xc5108) & (1u << 9)) xeGmbusRecover();
@@ -216,7 +279,7 @@ index 53d4288..d852f42 100755
  	// Caminho idêntico ao kext padrão quando o arg está ausente ou não é o pino HDMI: tail-call ao original.
  	if (!gHdmiDdc || bus != gHdmiBus || !req)
  		return FunctionCast(xeHwDoGMBusRequest, gOrgHwGmbus)(that, bus, speed, req);
-@@ -2233,6 +2360,21 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+@@ -2233,6 +2407,21 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
  
  	UInt32 n = OSIncrementAtomic(&gHdmiDdcCalls);
  
@@ -238,7 +301,7 @@ index 53d4288..d852f42 100755
  	// Sub-bloco de LEITURA do bloco-base do EDID: fase presente, buffer válido, slave do EDID, offset 0, 1..128 bytes.
  	// CORREÇÃO (2026-10-27): o IOI2CRequest carrega o endereço DDC na forma de 8 bits 0xA0 (= 0x50<<1); a Apple
  	// dobra esse byte no GMBUS1 em +0x0c e soma |1 (0xA1) no caminho de leitura (@0x7bef4/0x7befb). A run ao vivo
-@@ -2248,6 +2390,22 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+@@ -2248,6 +2437,22 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
  	bool noWrite      = (wcount == 0) && (wbuf == nullptr);
  	bool indexWriteOk = (wcount <= 1) && (wbyte == 0);
  	bool writeOk      = noWrite || indexWriteOk;
@@ -261,7 +324,7 @@ index 53d4288..d852f42 100755
  
  	// Servimos a leitura (pura OU indexada) do bloco-base do EDID no pino HDMI e no display 13. Tudo o mais -> original.
  	bool serveEdid = readOk && writeOk && !NGreen::callback->getIsRealTGL();
-@@ -2260,7 +2418,19 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+@@ -2260,7 +2465,19 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
  
  	if (!serveEdid) {
  		UInt32 p = OSIncrementAtomic(&gHdmiDdcPass);
@@ -281,7 +344,7 @@ index 53d4288..d852f42 100755
  		gHdmiDdcLastRes = rv;
  		snprintf(gHdmiDdcDiag, sizeof(gHdmiDdcDiag),
  				 "calls=%u served=%u pass=%u last=original case=%s kind=0x%x phase=%u w=%u ws=0x%x wb=0x%x r=%u rs=0x%x ro=0x%x res=0x%x",
-@@ -2274,7 +2444,21 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+@@ -2274,7 +2491,21 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
  	// Servimos com o nosso leitor GMBUS comprovado (mesma sequência de xeReadEdidGmbus; lê o bloco 0 do slave 0x50).
  	uint8_t edid[128];
  	bool ok = xeReadEdidGmbus(gHdmiBus, edid, rcount);
@@ -303,7 +366,7 @@ index 53d4288..d852f42 100755
  		// Não falsificamos: se a nossa leitura falhar, caímos no original (que registra o erro da Apple como antes).
  		UInt32 p = OSIncrementAtomic(&gHdmiDdcPass);
  		uint32_t rv = FunctionCast(xeHwDoGMBusRequest, gOrgHwGmbus)(that, bus, speed, req);
-@@ -2289,13 +2473,28 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+@@ -2289,13 +2520,28 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
  
  	// Preenche o buffer de leitura do chamador e marca sucesso, exatamente como o caminho de sucesso da Apple
  	// (grava [req+0x1c]=0 @0x7c25a e devolve 0). Copiamos só rcount bytes (<=128).
@@ -334,7 +397,7 @@ index 53d4288..d852f42 100755
  	if (n < 8) IOLog("XeHDMI ddc SERVED bus=%u case=%s r=%u hdr=%02x%02x%02x%02x | %s\n",
  					 bus, decoded, rcount, edid[0], edid[1], edid[2], edid[3], gEdidDiag);
  	return 0;
-@@ -2361,6 +2560,7 @@ static void installHdmiTrigger(KernelPatcher &patcher, size_t index, mach_vm_add
+@@ -2361,6 +2607,7 @@ static void installHdmiTrigger(KernelPatcher &patcher, size_t index, mach_vm_add
  	// quando gHdmiDdc && bus==gHdmiBus && display 13 && leitura pura de EDID; caso contrário chama o original.
  	bool okd = false;
  	if (gHdmiDdc) {
@@ -342,7 +405,7 @@ index 53d4288..d852f42 100755
  		RouteRequestPlus rd[] = {
  			{"__ZN24AppleIntelBaseController16hwDoGMBusRequestEjjP12IOI2CRequest", xeHwDoGMBusRequest, gOrgHwGmbus},
  		};
-@@ -6217,6 +6417,14 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
+@@ -6217,6 +6464,14 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
  		SYSLOG("ngreen", "getOSInformation: patched pinfo[1] for ADL-P (LVDS+HDMI, mobile)");
  	}
  	uint64_t ret = FunctionCast(getOSInformation, callback->ogetOSInformation)(that);

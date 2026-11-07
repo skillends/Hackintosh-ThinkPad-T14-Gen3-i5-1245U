@@ -9,6 +9,9 @@ Metal acceleration, HDMI with replug, ALC257 audio, internal DMIC microphone, ba
 > **Projeto experimental, sem garantia.** Pode ter algum erro. Mexe em firmware, kexts e limites de energia. Faça backup e mantenha um
 > pendrive de boot. Testado em uma única máquina.
 
+> **Baixou a EFI antes desta correção?** A primeira versão publicada só ligava com o cabo HDMI conectado: sem o cabo, a
+> tela interna não acendia. Atualize o `EFI/OC/Kexts/NootedGreen.kext`.
+
 ## Hardware testado
 
 | Componente | Modelo |
@@ -26,7 +29,7 @@ Metal acceleration, HDMI with replug, ALC257 audio, internal DMIC microphone, ba
 |---|---|
 | Aceleração gráfica | ✅ Metal |
 | Tela interna | ✅ 1920x1200 |
-| HDMI | ✅ Testado a 2560x1080, 60 Hz, inclusive ao reconectar o cabo. Sem áudio HDMI |
+| HDMI | ✅ Testado a 2560x1080, 60 Hz, inclusive ao reconectar o cabo. Liga com ou sem o cabo. Sem áudio HDMI |
 | Alto-falantes e fone | ✅ SimpleHDA + AppleALC, layout 11 |
 | Microfone interno | ✅ Driver experimental; veja [docs/MICROFONE.md](docs/MICROFONE.md) |
 | Câmera | ✅ USB |
@@ -52,6 +55,8 @@ Geekbench Metal registrado no início do projeto: 1635.
 
 - **HDMI ao reconectar:** o driver da Apple tentava HDCP (endereço I2C 0x74) na porta, o GMBUS ficava preso e o monitor
   não voltava. O kext agora responde a isso sem usar o barramento. O vídeo protegido no monitor externo pode ser afetado.
+- **Boot sem cabo HDMI:** uma resposta rápida de "sem monitor" no GMBUS coincidiu com a tela interna sem acender. Agora
+  ela só age depois que a tela interna responde, e o kext confere a energia dela se o AUX falhar.
 - **Queda de energia:** sem os drivers térmicos do Windows, o limite de energia oscilava. O kext aciona o modo
   desempenho da Lenovo (`DYTC 0x12B001`) e mantém os limites.
 - **Plano de frequência:** CPUFriend com o plano do iMac20,1, gerado a partir do próprio sistema.
