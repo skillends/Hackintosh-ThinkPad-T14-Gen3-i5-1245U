@@ -6,7 +6,7 @@ macOS Tahoe 26.7.2 com OpenCore e aceleração gráfica Metal na Intel Iris Xe 4
 *English summary:* macOS Tahoe on a Lenovo ThinkPad T14 Gen 3 (Intel Core i5-1245U, Alder Lake) with OpenCore: Iris Xe
 Metal acceleration, HDMI with replug, ALC257 audio, internal DMIC microphone, battery and AX211 Wi-Fi and Bluetooth.
 
-> **Projeto experimental, sem garantia.** Mexe em firmware, kexts e limites de energia. Faça backup e mantenha um
+> **Projeto experimental, sem garantia.** Pode ter algum erro. Mexe em firmware, kexts e limites de energia. Faça backup e mantenha um
 > pendrive de boot. Testado em uma única máquina.
 
 ## Hardware testado
@@ -33,7 +33,7 @@ Metal acceleration, HDMI with replug, ALC257 audio, internal DMIC microphone, ba
 | Bateria | ✅ ECEnabler |
 | Wi-Fi | ✅ AirportItlwm |
 | Bluetooth | ⚠️ Funciona, com falhas ocasionais; o fone pode cair em modo de chamada |
-| Trackpad | ⚠️ Polling, com engasgo leve |
+| Trackpad | ✅ Funcionando normal, em modo polling |
 | USB-C DP, HDCP e suspensão | ❌ ou não testados |
 
 ## Desempenho
