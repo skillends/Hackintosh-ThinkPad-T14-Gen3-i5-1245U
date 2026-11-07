@@ -1,0 +1,28 @@
+{
+  "tested_model": "Lenovo ThinkPad T14 Gen 3 (adaptacao, nao testada pelo autor do driver)",
+  "pci_vendor": "8086",
+  "pci_device": "51c8",
+  "pci_subsystem_vendor": "17aa",
+  "pci_subsystem_device": "22e8",
+  "pci_address": "00:1f.3",
+  "dsp": "Alder Lake / cAVS 2.5, host-managed core mask 1",
+  "capture": {
+    "physical_pdm_controller": 0,
+    "microphones": [
+      "A",
+      "B"
+    ],
+    "io_clock_hz": 38400000,
+    "clock_divisor": 16,
+    "pdm_clock_hz": 2400000,
+    "sample_rate_hz": 48000,
+    "channels": 2,
+    "container_bits": 32,
+    "nhlt_valid_bits": 32,
+    "clock_edge": 0,
+    "clock_skew": 0,
+    "duty_min_percent": 48,
+    "duty_max_percent": 52
+  },
+  "provenance": "NHLT LENOVO TP-N3M: 2 canais, 48 kHz, mic_control 0x00000e03 (divisor 16, A+B), ts_group 0xffffff10. O BIOS ativa PDM0 e PDM1; PDM0 e a escolha inicial."
+}

@@ -1,0 +1,747 @@
+diff --git a/src/NootedGreen/Info.plist b/src/NootedGreen/Info.plist
+index e291589..6b72bc7 100755
+--- a/src/NootedGreen/Info.plist
++++ b/src/NootedGreen/Info.plist
+@@ -103,6 +103,8 @@
+ 	<dict>
+ 		<key>as.vit9696.Lilu</key>
+ 		<string>1.6.4</string>
++		<key>com.apple.iokit.IOACPIFamily</key>
++		<string>1.0.0d1</string>
+ 		<key>com.apple.iokit.IOPCIFamily</key>
+ 		<string>1.0.0b1</string>
+ 		<key>com.apple.kpi.bsd</key>
+diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
+index 53d4288..d852f42 100755
+--- a/src/NootedGreen/kern_gen11.cpp
++++ b/src/NootedGreen/kern_gen11.cpp
+@@ -10,6 +10,7 @@ static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOCatalogue.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
+ #include <kern/thread_call.h>
+ // xe/blitscratch2: definidos em kern_green.cpp (wrapLockCpu)
+ extern void *volatile gXeBlitMem, *volatile gXeBlitCpu;
+@@ -1082,6 +1083,18 @@ static uint32_t gHdmiPw = 0;        // ngreenhdmipw
+ // ao slave 0x50 e depois lê N<=128 bytes do slave 0x50) com o nosso leitor; qualquer payload de escrita real,
+ // offset!=0, outro slave, leitura de extensão/segmento ou falha nossa cai no original sem mudança.
+ static uint32_t gHdmiDdc = 0;       // ngreenhdmiddc
++static uint32_t gHdmiBaseOnly = 0;  // ngreenhdmibaseonly: advertise only validated base EDID; extension reads fail promptly
++static volatile UInt32 gHdmiExtensionFails = 0;
++static IORecursiveLock *gHdmiGmbusLock = nullptr;
++static volatile UInt32 gHdmiGmbusStops = 0;
++static char gHdmiGmbusLastNative[256];
++struct XeGmbusScope {
++	IORecursiveLock *lock;
++	bool held;
++	explicit XeGmbusScope(IORecursiveLock *l) : lock(l), held(l && IORecursiveLockTryLock(l)) {}
++	bool ready() const { return !lock || held; }
++	~XeGmbusScope() { if (held) IORecursiveLockUnlock(lock); }
++};
+ // ngreenhdmiregs (27/10): snapshot READ-ONLY de um conjunto fixo de registradores do pipe B (power wells, fuse,
+ // DPCLKA/PLL enables, DDI_BUF_CTL_B, TRANS_DDI_FUNC_CTL_B, TRANSCONF_B, PIPE_SRCSZ_B, combo PHY B) lido com
+ // NGreen::readReg32 (BAR0) e publicado em ngreen-hdmiregs. Com ngreenhdmiflags=0x202 + ngreenhdmiddc o monitor LG
+@@ -1204,6 +1217,7 @@ static void patchPortModeVtable(KernelPatcher &patcher, size_t index, mach_vm_ad
+ 	// mesma forma dos irmãos (valor numérico ou flag "-"). Default 0 => kext idêntico ao que boota.
+ 	PE_parse_boot_argn("ngreenhdmiddc", &gHdmiDdc, sizeof(gHdmiDdc));
+ 	if (checkKernelArgument("-ngreenhdmiddc")) gHdmiDdc = 1;
++	PE_parse_boot_argn("ngreenhdmibaseonly", &gHdmiBaseOnly, sizeof(gHdmiBaseOnly));
+ 	// ngreenhdmiregs (27/10): snapshot read-only dos registradores do pipe B. Opt-in, mesma forma dos irmãos
+ 	// (valor numérico ou flag "-"). Default 0 => kext idêntico ao que boota (nenhuma leitura extra de MMIO).
+ 	PE_parse_boot_argn("ngreenhdmiregs", &gHdmiRegs, sizeof(gHdmiRegs));
+@@ -1696,6 +1710,16 @@ static void xeD13LogLong(const char *tag, const char *s) {   // o IOLog corta li
+ static void xeD13Publish() {
+ 	IOService *svc = gXeD13Svc;
+ 	if (!svc) return;
++	// Keep initialization results readable after the boot log wraps. This is
++	// diagnostic only: no MMIO access and no change to the HDMI enable sequence.
++	char init[256];
++	snprintf(init, sizeof(init), "T14-HDMI-DDC3 baseonly=%u light=%u ready=%d f10=%d rnu=%d enclk=%d disclk=%d mailbox=%d volt=%d ddi=%d/%d realtgl=%d",
++		gHdmiBaseOnly, gHdmiLight, (int)gXeD13Ready, (int)gXeD13F10Undone, (int)(gXeD13RnuRet != 0),
++		(int)(gXeD13OrgEnClk != 0), (int)(gXeD13OrgDisClk != 0), (int)(gXeD13FnMailbox != 0),
++		(int)(gXeD13FnVolt != 0), (int)(gXeD13FnDdiOn != 0), (int)(gXeD13FnDdiOff != 0),
++		(int)NGreen::callback->getIsRealTGL());
++	svc->setProperty("ngreen-hdmi13-init", init);
++	if (gHdmiGmbusLastNative[0]) svc->setProperty("ngreen-hdmiddc-lastnative", gHdmiGmbusLastNative);
+ 	char sum[200];
+ 	snprintf(sum, sizeof(sum), "light=%u f10undone=%d held=0x%x pll=%u pipe=%u forces=%u lightups=%u clkon=%u clkoff=%u",
+ 			 gHdmiLight, (int)gXeD13F10Undone, (unsigned)gXeD13Held, gXeD13Pll, gXeD13Pipe, (unsigned)gXeD13Forces,
+@@ -1786,7 +1810,11 @@ static int xeD13RnuDecision(void *ctrl, void *fb, void *path, const void *ret) {
+ 	if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(ctrl))) gXeD13Svc = svc;
+ 	xeD13PowerOn(pipe, "rnu");
+ 	const uint32_t tconf = xeD13Rd(0x70008 + 0x1000 * pipe), buf = xeD13Rd(xeD13DdiBuf());
+-	const bool lit = (tconf & 0xC0000000u) == 0xC0000000u && (buf & 0x80000000u) && !(buf & 0x80u);
++	const uint32_t clocks = xeD13Rd(kD13Dpclka);
++	const uint32_t selectedPll = (clocks >> xeD13SelShift()) & 3;
++	const bool clockReady = selectedPll < 2 && selectedPll == gXeD13Pll && !(clocks & xeD13ClkOff()) &&
++		(xeD13Rd(0x46010 + 4 * selectedPll) & 0xC0000000u) == 0xC0000000u;
++	const bool lit = (!gHdmiBaseOnly || clockReady) && (tconf & 0xC0000000u) == 0xC0000000u && (buf & 0x80000000u) && !(buf & 0x80u);
+ 	const UInt32 f = gXeD13Forces;
+ 	const int d = lit ? -1 : f < 6 ? 1 : 0;
+ 	if (d == 1) OSIncrementAtomic(&gXeD13Forces);
+@@ -1896,9 +1924,69 @@ static bool xeGmbusWait(uint32_t wantBit, int maxUs) {
+ static char gEdidDiag[120];
+ static char gPathDiag[160];
+ static char gProbe0[96], gProbe1[112];
++// GMBUS_ACTIVE is bit 9, not bit 8. Ignore NAK while waiting for idle:
++// Intel's error recovery requires the bus to quiesce before clearing NAK.
++static bool xeGmbusWaitIdle() {
++	for (uint32_t us = 0; us <= 10000; us += 10) {
++		if (!(NGreen::callback->readReg32(0xc5108) & (1u << 9))) return true;
++		IODelay(10);
++	}
++	return false;
++}
++// T14: o cabo pode sair no meio de uma leitura. GMBUS2 fica com ACTIVE e HW_RDY (0x8a00): ha dados pendentes e o
++// ciclo nunca termina. Esvazia GMBUS3, pede STOP e, com o barramento parado, limpa o erro como o i915.
++static volatile UInt32 gHdmiGmbusRecovers = 0, gHdmiGmbusRecoverOk = 0;
++static uint32_t gHdmiGmbusRecoverBefore = 0, gHdmiGmbusRecoverAfter = 0;
++static bool xeGmbusRecover() {
++	auto wr = [](uint32_t r, uint32_t v) { NGreen::callback->writeReg32(r, v); };
++	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
++	gHdmiGmbusRecoverBefore = rd(0xc5108);
++	OSIncrementAtomic(&gHdmiGmbusRecovers);
++	bool idle = false;
++	for (int pass = 0; pass < 3 && !idle; pass++) {
++		for (int i = 0; i < 64 && (rd(0xc5108) & 0x800); i++) {
++			(void)rd(0xc510c);
++			IODelay(20);
++		}
++		wr(0xc5100, gHdmiBus & 0xf);   // STOP precisa do pino selecionado
++		wr(0xc5104, (1u << 30) | (4u << 25));
++		idle = xeGmbusWaitIdle();
++		if (!idle) {                   // ultimo recurso entre tentativas: limpa e tenta de novo
++			wr(0xc5104, 1u << 31);
++			wr(0xc5104, 0);
++		}
++	}
++	if (idle) {
++		wr(0xc5104, 1u << 31);
++		wr(0xc5104, 0);
++		wr(0xc5100, 0);
++		wr(0xc5110, 0);
++		OSIncrementAtomic(&gHdmiGmbusRecoverOk);
++	}
++	gHdmiGmbusRecoverAfter = rd(0xc5108);
++	return idle;
++}
+ static bool xeReadEdidGmbus(uint32_t pin, uint8_t *buf, uint32_t len) {
++	XeGmbusScope busScope(gHdmiBaseOnly ? gHdmiGmbusLock : nullptr);
++	if (!busScope.ready()) return false;
+ 	auto wr = [](uint32_t r, uint32_t v) { NGreen::callback->writeReg32(r, v); };
+ 	auto rd = [](uint32_t r) { return NGreen::callback->readReg32(r); };
++	if (gHdmiBaseOnly && !xeGmbusWaitIdle()) {
++		// The preceding native request may leave an indexed transfer open.
++		// All routed GMBUS calls share the lock; finish that old cycle with
++		// STOP before starting our independent indexed read. Never clear NAK
++		// or reset the controller while ACTIVE is still set.
++		const uint32_t before = rd(0xc5108);
++		if (gHdmiGmbusLock) {
++			OSIncrementAtomic(&gHdmiGmbusStops);
++			wr(0xc5104, (1u << 30) | (4u << 25));
++		}
++		if (gHdmiGmbusLock && !xeGmbusWaitIdle()) xeGmbusRecover();
++		if (!gHdmiGmbusLock || !xeGmbusWaitIdle()) {
++			snprintf(gEdidDiag, sizeof(gEdidDiag), "T14-DDC3 stop-failed before=0x%x after=0x%x stops=%u", before, rd(0xc5108), (unsigned)gHdmiGmbusStops);
++			return false;
++		}
++	}
+ 	wr(0xc5110, 0);                            // GMBUS4: sem interrupção (vamos pollar)
+ 	wr(0xc5104, 0x80000000);                   // GMBUS1: SW_CLR_INT (limpa estado preso)
+ 	wr(0xc5104, 0);
+@@ -1920,9 +2008,26 @@ static bool xeReadEdidGmbus(uint32_t pin, uint8_t *buf, uint32_t len) {
+ 		for (uint32_t b = 0; b < 4 && i + b < len; b++) buf[i + b] = (v >> (8 * b)) & 0xff;
+ 	}
+ 	if (okall) st1 = rd(0xc5108);
+-	snprintf(gEdidDiag, sizeof(gEdidDiag), "g0rb=0x%x st0=0x%x st1=0x%x", g0rb, st0, st1);
+-	wr(0xc5104, (1u << 30) | (4u << 25)); // GMBUS1: SW_RDY | CYCLE_STOP (finaliza)
+-	xeGmbusWait(0x100, 10000);            // espera breve o INUSE/WAIT baixar
++	if (gHdmiBaseOnly) {
++		// i915: finish the WAIT phase, issue STOP, then wait for ACTIVE=0.
++		// On NAK, wait for idle before toggling SW_CLR_INT; otherwise the
++		// controller can remain stuck for the next plug.
++		if (okall) okall = xeGmbusWait(1u << 14, 10000);
++		if (okall) wr(0xc5104, (1u << 30) | (4u << 25));
++		bool idle = xeGmbusWaitIdle();
++		if (idle && (!okall || (rd(0xc5108) & (1u << 10)))) {
++			wr(0xc5104, 1u << 31);
++			wr(0xc5104, 0);
++		}
++		if (!idle) idle = xeGmbusRecover();
++		okall = okall && idle;
++		snprintf(gEdidDiag, sizeof(gEdidDiag), "T14-DDC3 g0=0x%x st0=0x%x st1=0x%x final=0x%x idle=%d",
++			g0rb, st0, st1, rd(0xc5108), (int)idle);
++	} else {
++		snprintf(gEdidDiag, sizeof(gEdidDiag), "g0rb=0x%x st0=0x%x st1=0x%x", g0rb, st0, st1);
++		wr(0xc5104, (1u << 30) | (4u << 25));
++		xeGmbusWait(0x100, 10000);
++	}
+ 	wr(0xc5100, 0);                       // libera o GMBUS
+ 	return okall;
+ }
+@@ -2121,6 +2226,14 @@ static void xeHotplugHook(void *controller, uint32_t ddi, uint32_t portMode) {
+ 				xeHdmiLightUp(svc);
+ 			}
+ 		}
++		if (gHdmiBaseOnly) {
++			char recover[96];
++			snprintf(recover, sizeof(recover), "recovers=%u ok=%u before=0x%x after=0x%x agora=0x%x",
++				(unsigned)gHdmiGmbusRecovers, (unsigned)gHdmiGmbusRecoverOk, gHdmiGmbusRecoverBefore,
++				gHdmiGmbusRecoverAfter, NGreen::callback->readReg32(0xc5108));
++			if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(controller)))
++				svc->setProperty("ngreen-gmbus-recover", recover);
++		}
+ 		if (gHdmiSink && gSinkDiag[0]) {
+ 			if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(controller)))
+ 				svc->setProperty("ngreen-sink", gSinkDiag);
+@@ -2215,6 +2328,20 @@ static bool xeConnProbeHook(void *fbv) {
+ //   sub-bloco de escrita seja no máximo UM byte de índice 0. Qualquer payload de escrita real (wcount>1 ou wbyte!=0),
+ //   offset!=0, outro slave, contagem>128, outro pino ou display real cai no original SEM alteração (nunca falsificamos).
+ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, void *req) {
++	// GMBUS is shared by all pins. Serialize native and custom transactions,
++	// including other pins, rather than resetting a concurrent caller's bus.
++	XeGmbusScope busScope(gHdmiBaseOnly ? gHdmiGmbusLock : nullptr);
++	if (!busScope.ready()) {
++		if (req) getMember<uint32_t>(req, 0x1c) = kIOReturnBusy;
++		return kIOReturnBusy; // Avoid lock-order stalls; caller can retry.
++	}
++	// T14: sem cabo nao ha monitor para ler. Responder na hora evita prender o barramento.
++	if (gHdmiBaseOnly && gHdmiDdc && bus == gHdmiBus && req && !NGreen::callback->getIsRealTGL() &&
++		!(NGreen::callback->readReg32(0xc4000) & (1u << (16 + gHdmiDdi)))) {
++		getMember<uint32_t>(req, 0x1c) = kIOReturnNotResponding;
++		if (NGreen::callback->readReg32(0xc5108) & (1u << 9)) xeGmbusRecover();
++		return kIOReturnNotResponding;
++	}
+ 	// Caminho idêntico ao kext padrão quando o arg está ausente ou não é o pino HDMI: tail-call ao original.
+ 	if (!gHdmiDdc || bus != gHdmiBus || !req)
+ 		return FunctionCast(xeHwDoGMBusRequest, gOrgHwGmbus)(that, bus, speed, req);
+@@ -2233,6 +2360,21 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+ 
+ 	UInt32 n = OSIncrementAtomic(&gHdmiDdcCalls);
+ 
++	// T14: HDCP (0x74/0x75) nesta porta falha e pode deixar o GMBUS em ACTIVE. Responde sem usar o barramento.
++	if (gHdmiBaseOnly && !NGreen::callback->getIsRealTGL() &&
++		((wslave >> 1) == 0x3a || (rslave >> 1) == 0x3a)) {
++		static volatile UInt32 gHdmiHdcpBlocked = 0;
++		UInt32 blocked = OSIncrementAtomic(&gHdmiHdcpBlocked);
++		getMember<uint32_t>(r, 0x1c) = kIOReturnNotResponding;
++		if ((blocked & 0xf) == 0) {
++			char hdcp[64];
++			snprintf(hdcp, sizeof(hdcp), "bloqueios=%u", (unsigned)(blocked + 1));
++			if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(that)))
++				svc->setProperty("ngreen-hdcp-blocked", hdcp);
++		}
++		return kIOReturnNotResponding;
++	}
++
+ 	// Sub-bloco de LEITURA do bloco-base do EDID: fase presente, buffer válido, slave do EDID, offset 0, 1..128 bytes.
+ 	// CORREÇÃO (2026-10-27): o IOI2CRequest carrega o endereço DDC na forma de 8 bits 0xA0 (= 0x50<<1); a Apple
+ 	// dobra esse byte no GMBUS1 em +0x0c e soma |1 (0xA1) no caminho de leitura (@0x7bef4/0x7befb). A run ao vivo
+@@ -2248,6 +2390,22 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+ 	bool noWrite      = (wcount == 0) && (wbuf == nullptr);
+ 	bool indexWriteOk = (wcount <= 1) && (wbyte == 0);
+ 	bool writeOk      = noWrite || indexWriteOk;
++	// T14: observed kind=0/phase=1, EDID offset 0x80, 128-byte reads
++	// repeatedly fall through to Apple's failing GMBUS path. Opt-in: preserve
++	// the same failure, without touching the bus for this unsupported block.
++	// Base EDID, other devices, writes and real Tiger Lake are unchanged.
++	if (gHdmiBaseOnly && kind == 0 && phase == 1 && rbuf && rcount == 128 &&
++		(rslave >> 1) == 0x50 && roffset == 0x80 && writeOk &&
++		!NGreen::callback->getIsRealTGL()) {
++		getMember<uint32_t>(r, 0x1c) = kIOReturnNotResponding;
++		gHdmiDdcLastRes = kIOReturnNotResponding;
++		UInt32 f = OSIncrementAtomic(&gHdmiExtensionFails);
++		snprintf(gHdmiDdcDiag, sizeof(gHdmiDdcDiag),
++			"calls=%u served=%u pass=%u last=extension-fastfail fastfails=%u ro=0x80 r=128 res=0x%x",
++			(unsigned)(n + 1), (unsigned)gHdmiDdcServed, (unsigned)gHdmiDdcPass,
++			(unsigned)(f + 1), (unsigned)kIOReturnNotResponding);
++		return kIOReturnNotResponding;
++	}
+ 
+ 	// Servimos a leitura (pura OU indexada) do bloco-base do EDID no pino HDMI e no display 13. Tudo o mais -> original.
+ 	bool serveEdid = readOk && writeOk && !NGreen::callback->getIsRealTGL();
+@@ -2260,7 +2418,19 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+ 
+ 	if (!serveEdid) {
+ 		UInt32 p = OSIncrementAtomic(&gHdmiDdcPass);
++		const uint32_t before = gHdmiBaseOnly ? NGreen::callback->readReg32(0xc5108) : 0;
+ 		uint32_t rv = FunctionCast(xeHwDoGMBusRequest, gOrgHwGmbus)(that, bus, speed, req);
++		if (gHdmiBaseOnly) {
++			snprintf(gHdmiGmbusLastNative, sizeof(gHdmiGmbusLastNative),
++				"T14-DDC3 kind=%u phase=%u w=%u ws=0x%x wb=0x%x r=%u rs=0x%x ro=0x%x before=0x%x after=0x%x result=0x%x",
++				kind, phase, wcount, wslave, wbyte, rcount, rslave, roffset, before, NGreen::callback->readReg32(0xc5108), rv);
++			if (NGreen::callback->readReg32(0xc5108) & (1u << 9)) {
++				IODelay(200);
++				if (NGreen::callback->readReg32(0xc5108) & (1u << 9)) xeGmbusRecover();
++			}
++			if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(that)))
++				svc->setProperty("ngreen-hdmiddc-lastnative", gHdmiGmbusLastNative);
++		}
+ 		gHdmiDdcLastRes = rv;
+ 		snprintf(gHdmiDdcDiag, sizeof(gHdmiDdcDiag),
+ 				 "calls=%u served=%u pass=%u last=original case=%s kind=0x%x phase=%u w=%u ws=0x%x wb=0x%x r=%u rs=0x%x ro=0x%x res=0x%x",
+@@ -2274,7 +2444,21 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+ 	// Servimos com o nosso leitor GMBUS comprovado (mesma sequência de xeReadEdidGmbus; lê o bloco 0 do slave 0x50).
+ 	uint8_t edid[128];
+ 	bool ok = xeReadEdidGmbus(gHdmiBus, edid, rcount);
++	if (gHdmiBaseOnly) {
++		if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(that))) {
++			svc->setProperty("ngreen-hdmiddc-recovery", gEdidDiag);
++			svc->setProperty("ngreen-hdmiddc-stops", (uint64_t)gHdmiGmbusStops, 32);
++		}
++	}
+ 	if (!ok) {
++		if (gHdmiBaseOnly) {
++			getMember<uint32_t>(r, 0x1c) = kIOReturnNotResponding;
++			gHdmiDdcLastRes = kIOReturnNotResponding;
++			snprintf(gHdmiDdcDiag, sizeof(gHdmiDdcDiag),
++				"calls=%u served=%u pass=%u last=ddc3-read-failed r=%u | %s",
++				(unsigned)(n + 1), (unsigned)gHdmiDdcServed, (unsigned)gHdmiDdcPass, rcount, gEdidDiag);
++			return kIOReturnNotResponding;
++		}
+ 		// Não falsificamos: se a nossa leitura falhar, caímos no original (que registra o erro da Apple como antes).
+ 		UInt32 p = OSIncrementAtomic(&gHdmiDdcPass);
+ 		uint32_t rv = FunctionCast(xeHwDoGMBusRequest, gOrgHwGmbus)(that, bus, speed, req);
+@@ -2289,13 +2473,28 @@ static uint32_t xeHwDoGMBusRequest(void *that, uint32_t bus, uint32_t speed, voi
+ 
+ 	// Preenche o buffer de leitura do chamador e marca sucesso, exatamente como o caminho de sucesso da Apple
+ 	// (grava [req+0x1c]=0 @0x7c25a e devolve 0). Copiamos só rcount bytes (<=128).
++	bool baseOnlyApplied = false;
++	if (gHdmiBaseOnly && rcount == sizeof(edid)) {
++		static const uint8_t header[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
++		uint8_t sum = 0;
++		for (uint32_t i = 0; i < sizeof(edid); i++) sum += edid[i];
++		if (!memcmp(edid, header, sizeof(header)) && sum == 0) {
++			// This driver cannot read CTA extensions. Keep all base timings and
++			// identity bytes, remove the extension count and balance the checksum.
++			// This retains the existing DVI-compatible output without claiming
++			// HDMI audio or other unread capabilities.
++			edid[127] = (uint8_t)(edid[127] + edid[126]);
++			edid[126] = 0;
++			baseOnlyApplied = true;
++		}
++	}
+ 	memcpy(rbuf, edid, rcount);
+ 	getMember<uint32_t>(r, 0x1c) = 0;
+ 	UInt32 s = OSIncrementAtomic(&gHdmiDdcServed);
+ 	gHdmiDdcLastRes = 0;
+ 	snprintf(gHdmiDdcDiag, sizeof(gHdmiDdcDiag),
+-			 "calls=%u served=%u pass=%u last=served case=%s r=%u hdr=%02x%02x res=0x0 | %s",
+-			 (unsigned)(n + 1), (unsigned)(s + 1), (unsigned)gHdmiDdcPass, decoded, rcount, edid[0], edid[1], gEdidDiag);
++			 "calls=%u served=%u pass=%u last=served case=%s r=%u hdr=%02x%02x baseonly=%d res=0x0 | %s",
++			 (unsigned)(n + 1), (unsigned)(s + 1), (unsigned)gHdmiDdcPass, decoded, rcount, edid[0], edid[1], (int)baseOnlyApplied, gEdidDiag);
+ 	if (n < 8) IOLog("XeHDMI ddc SERVED bus=%u case=%s r=%u hdr=%02x%02x%02x%02x | %s\n",
+ 					 bus, decoded, rcount, edid[0], edid[1], edid[2], edid[3], gEdidDiag);
+ 	return 0;
+@@ -2361,6 +2560,7 @@ static void installHdmiTrigger(KernelPatcher &patcher, size_t index, mach_vm_add
+ 	// quando gHdmiDdc && bus==gHdmiBus && display 13 && leitura pura de EDID; caso contrário chama o original.
+ 	bool okd = false;
+ 	if (gHdmiDdc) {
++		if (gHdmiBaseOnly && !gHdmiGmbusLock) gHdmiGmbusLock = IORecursiveLockAlloc();
+ 		RouteRequestPlus rd[] = {
+ 			{"__ZN24AppleIntelBaseController16hwDoGMBusRequestEjjP12IOI2CRequest", xeHwDoGMBusRequest, gOrgHwGmbus},
+ 		};
+@@ -6217,6 +6417,14 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
+ 		SYSLOG("ngreen", "getOSInformation: patched pinfo[1] for ADL-P (LVDS+HDMI, mobile)");
+ 	}
+ 	uint64_t ret = FunctionCast(getOSInformation, callback->ogetOSInformation)(that);
++	// Publish even when HDMI initialization failed and xeD13Active() is false.
++	// The existing hotplug diagnostics otherwise hide precisely that case.
++	if (gHdmiLight >= 2 && that) {
++		if (auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(that))) {
++			gXeD13Svc = svc;
++			xeD13Publish();
++		}
++	}
+ 	// Diagnóstico sobrevivente (o log do kernel é varrido pelo spam de AUX): a entrada ativa é escolhida pela
+ 	// getOSInformation original e guardada em controller+0xd40. Lemos con1 de LÁ (é a struct que cria as portas),
+ 	// reforçamos os campos do HDMI, e publicamos no IORegistry p/ o relatório ler com ioreg a qualquer momento.
+diff --git a/src/NootedGreen/kern_xepm.cpp b/src/NootedGreen/kern_xepm.cpp
+index 6df9d5a..8a76351 100644
+--- a/src/NootedGreen/kern_xepm.cpp
++++ b/src/NootedGreen/kern_xepm.cpp
+@@ -26,8 +26,11 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/pci/IOPCIDevice.h>
++#include <IOKit/acpi/IOACPIPlatformDevice.h>
+ #include <kern/thread_call.h>
++#include <kern/clock.h>
+ #include <sys/sysctl.h>
++#include "kern_xepm_policy.hpp"
+ 
+ extern "C" void mp_rendezvous_no_intrs(void (*fn)(void *), void *arg);
+ extern "C" int cpu_number(void);
+@@ -115,9 +118,28 @@ static int xpD3() {
+ }
+ 
+ // ─── 6: MCHBAR PL1 ───────────────────────────────────────────────────────────────────────────────────────────────
++static int gXpMsrPl1Before = 0, gXpMsrPl1 = 0, gXpMsrPl2 = 0, gXpMsrLock = 0;   // T14: MSR 0x610
++static int gXpMmioLo = 0, gXpMmioHi = 0;   // T14: valores encontrados no MCHBAR antes de reaplicar
+ static int gXpPl1 = 0, gXpPl1Set = 0;   // requested watts, written value (1/8 W units) read back
+-static void xpPl1() {
++static int gXpPl2 = 0, gXpHold = 0, gXpHoldHot = 0, gXpHoldTemp = 0;
++static int gXpPollMs = 2000, gXpTripC = 85, gXpResumeC = 75;
++static thread_call_t gXpHoldCall = nullptr;
++static IOLock *gXpPowerLock = nullptr;
++
++static int xpPackageTemperature() {
++	const int tj = (int)(xpRdmsr(0x1A2) >> 16) & 0xFF;
++	const int delta = (int)(xpRdmsr(0x1B1) >> 16) & 0x7F;
++	return tj >= 60 && tj <= 125 && delta <= tj ? tj - delta : -1;
++}
++
++static void xpUpdatePl1() {
+ 	if (gXpPl1 <= 0) return;
++	bool hot = false;
++	if (gXpHold) {
++		gXpHoldTemp = xpPackageTemperature();
++		gXpHoldHot = xpPolicyHot(gXpHoldHot != 0, gXpHoldTemp, gXpTripC, gXpResumeC);
++		hot = gXpHoldHot != 0;
++	}
+ 	uint64_t mch = 0;
+ 	OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+ 	if (!it) return;
+@@ -132,14 +154,42 @@ static void xpPl1() {
+ 	it->release();
+ 	if (!mch) return;
+ 	const uint32_t unit = (uint32_t)(xpRdmsr(0x606) & 0xF);   // power unit 1/2^n W (3 -> 1/8 W)
++	{   // T14: vale o menor entre MCHBAR e MSR 0x610. So sobe o PL1 e respeita a trava.
++		const uint64_t m = xpRdmsr(0x610);
++		gXpMsrPl1Before = (int)(m & 0x7FFF);
++		gXpMsrPl2 = (int)((m >> 32) & 0x7FFF);
++		gXpMsrLock = (int)(m >> 63);
++		const uint32_t wantMsr = (uint32_t)gXpPl1 << unit;
++		if (!hot && !gXpMsrLock && wantMsr && wantMsr <= 0x7FFF && (m & 0x7FFF) < wantMsr)
++			xpWrmsr(0x610, (m & ~0x7FFFULL) | wantMsr | 0x8000ULL);
++		if (gXpPl2 && !gXpMsrLock) {
++			const uint64_t current = xpRdmsr(0x610);
++			const uint32_t cap = (uint32_t)(hot ? 20 : gXpPl2) << unit;
++			const uint32_t next = xpPolicyLimit((uint32_t)(current >> 32), cap, hot);
++			if ((uint32_t)(current >> 32) != next)
++				xpWrmsr(0x610, (current & 0xFFFFFFFFULL) | ((uint64_t)next << 32));
++			gXpMsrPl2 = (int)((xpRdmsr(0x610) >> 32) & 0x7FFF);
++		}
++		gXpMsrPl1 = (int)(xpRdmsr(0x610) & 0x7FFF);
++	}
+ 	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(mch + 0x5000, 0x1000, kIODirectionInOut);
+ 	if (!md) return;
+ 	if (IOMemoryMap *mm = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache)) {
+ 		auto *lo = reinterpret_cast<volatile uint32_t *>(mm->getVirtualAddress() + 0x9A0);
+ 		auto *hi = reinterpret_cast<volatile uint32_t *>(mm->getVirtualAddress() + 0x9A4);
++		gXpMmioLo = (int)*lo;
++		gXpMmioHi = (int)*hi;
+ 		if (!(*hi & 0x80000000U)) {   // lock bit 63
+-			const uint32_t want = (uint32_t)gXpPl1 << unit;
+-			if (want && want <= 0x7FFF && (*lo & 0x7FFF) != want) *lo = (*lo & ~0x7FFFU) | want | 0x8000U;   // + enable
++			const uint32_t want = (uint32_t)(hot && gXpPl1 > 20 ? 20 : gXpPl1) << unit;
++			if (want && want <= 0x7FFF) {
++				const uint32_t next = xpPolicyLimit(*lo, want, hot);
++				if (*lo != next) *lo = next;
++			}
++			if (gXpPl2) {
++				const uint32_t cap = (uint32_t)(hot ? 20 : gXpPl2) << unit;
++				const uint32_t next = xpPolicyLimit(*hi, cap, hot);
++				if (*hi != next) *hi = next;
++			}
+ 			gXpPl1Set = (int)(*lo & 0x7FFF);
+ 		} else gXpPl1Set = -1;
+ 		mm->release();
+@@ -147,8 +197,55 @@ static void xpPl1() {
+ 	md->release();
+ }
+ 
++static void xpPl1() {
++	if (!gXpPowerLock) return;
++	IOLockLock(gXpPowerLock);
++	xpUpdatePl1();
++	IOLockUnlock(gXpPowerLock);
++}
++
++static void xpMaintain(thread_call_param_t, thread_call_param_t) {
++	xpPl1();
++	uint64_t deadline;
++	clock_interval_to_deadline(gXpPollMs, kMillisecondScale, &deadline);
++	thread_call_enter_delayed(gXpHoldCall, deadline);
++}
++
++// Independent read: does NOT call xpPl1 or write any CPU/PCI register.
++static int xpReadMmio(uint64_t *value) {
++	uint64_t mch = 0;
++	OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
++	if (!it) return ENXIO;
++	while (auto *o = it->getNextObject()) {
++		auto *d = OSDynamicCast(IOPCIDevice, o);
++		if (d && !d->getBusNumber() && !d->getDeviceNumber() && !d->getFunctionNumber()) {
++			const uint64_t address = ((uint64_t)d->configRead32(0x4C) << 32) | d->configRead32(0x48);
++			if (address & 1) mch = address & 0x7FFFFE0000ULL;
++			break;
++		}
++	}
++	it->release();
++	if (!mch) return ENXIO;
++	auto *md = IOMemoryDescriptor::withPhysicalAddress(mch + 0x5000, 0x1000, kIODirectionIn);
++	if (!md) return ENOMEM;
++	auto *mm = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
++	if (!mm) { md->release(); return ENOMEM; }
++	auto *p = reinterpret_cast<volatile uint64_t *>(mm->getVirtualAddress() + 0x9A0);
++	*value = *p;
++	mm->release();
++	md->release();
++	return 0;
++}
++
++static IOReturn xpDytc(uint32_t arg, uint32_t *out);
++static int gXpDytcBoot = 0, gXpDytcBootErr = -1;
+ static void xpApply(thread_call_param_t, thread_call_param_t) {
+ 	xpPl1();
++	if (gXpDytcBoot) {
++		uint32_t ret = 0;
++		gXpDytcBootErr = (int)xpDytc(0x12B001, &ret);   // repetido em cada reaplicacao do perfil
++		IOLog("XeNG PM: DYTC boot err 0x%x ret 0x%x\n", gXpDytcBootErr, ret);
++	}
+ 	gXpCst = xpCstFix();
+ 	gXpD3 += xpD3();
+ 	if (!gXpEet) { mp_rendezvous_no_intrs(xpEetOne, nullptr); gXpEet = (int)((xpRdmsr(0x1FC) >> 19) & 1); }
+@@ -188,8 +285,95 @@ static int xpSensors SYSCTL_HANDLER_ARGS {
+ 	return SYSCTL_OUT(req, &gXpSens, sizeof(gXpSens));
+ }
+ 
++// Separate ABI: keep the existing 112-byte sensors structure unchanged.
++// All accesses are reads, capability-gated, and each CPU owns its slot.
++struct XpCpuDiagEntry {
++	uint32_t cpu;
++	uint16_t type, flags;
++	uint32_t leaf6a, leaf6c;
++	uint64_t tsc, aperf, mperf, pmEnable, hwpCap, hwpRequest, hwpPackage, limit64f;
++};
++struct XpCpuDiag {
++	uint32_t version, entryBytes, capacity, validMask;
++	uint64_t beginAbs, endAbs;
++	XpCpuDiagEntry cpu[32];
++};
++static_assert(sizeof(XpCpuDiagEntry) == 80, "CPU diagnostic entry ABI");
++static_assert(sizeof(XpCpuDiag) == 2592, "CPU diagnostic ABI");
++static XpCpuDiag gXpDiag;
++static IOLock *gXpDiagLock = nullptr;
++
++static void xpCpuid(uint32_t leaf, uint32_t out[4]) {
++	asm volatile("cpuid" : "=a"(out[0]), "=b"(out[1]), "=c"(out[2]), "=d"(out[3]) : "a"(leaf), "c"(0));
++}
++
++static void xpDiagOne(void *) {
++	const int c = cpu_number();
++	if (c < 0 || c >= 32) return;
++	auto &entry = gXpDiag.cpu[c];
++	entry.cpu = (uint32_t)c;
++	uint32_t r[4];
++	xpCpuid(0, r);
++	const uint32_t maxLeaf = r[0];
++	if (maxLeaf >= 0x1A) { xpCpuid(0x1A, r); entry.type = (uint16_t)(r[0] >> 24); }
++	if (maxLeaf >= 6) { xpCpuid(6, r); entry.leaf6a = r[0]; entry.leaf6c = r[2]; }
++	xpCpuid(0x80000000, r);
++	if (r[0] >= 0x80000007) {
++		xpCpuid(0x80000007, r);
++		if (r[3] & (1U << 8)) entry.flags |= 32; // invariant TSC
++	}
++	if (entry.leaf6c & 1) {
++		entry.aperf = xpRdmsr(0xE8);
++		entry.mperf = xpRdmsr(0xE7);
++		entry.flags |= 2;
++	}
++	if (entry.leaf6a & (1U << 7)) {
++		entry.pmEnable = xpRdmsr(0x770);
++		if (entry.pmEnable & 1) {
++			entry.hwpCap = xpRdmsr(0x771);
++			entry.hwpRequest = xpRdmsr(0x774);
++			entry.flags |= 4;
++			if (entry.leaf6a & (1U << 11)) {
++				entry.hwpPackage = xpRdmsr(0x772);
++				entry.flags |= 8;
++			}
++		}
++	}
++	if (maxLeaf >= 1) {
++		xpCpuid(1, r);
++		const uint32_t family = (r[0] >> 8) & 0xF;
++		const uint32_t model = ((r[0] >> 4) & 0xF) | ((r[0] >> 12) & 0xF0);
++		if (family == 6 && model == 0x9A) {
++			entry.limit64f = xpRdmsr(0x64F);
++			entry.flags |= 16;
++		}
++	}
++	uint32_t lo, hi;
++	asm volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
++	entry.tsc = ((uint64_t)hi << 32) | lo;
++	entry.flags |= 1;
++	__sync_fetch_and_or(&gXpDiag.validMask, 1U << c);
++}
++
++static int xpCpuDiag SYSCTL_HANDLER_ARGS {
++	if (req->newptr) return EPERM;
++	if (!gXpDiagLock) return ENOMEM;
++	IOLockLock(gXpDiagLock);
++	bzero(&gXpDiag, sizeof(gXpDiag));
++	gXpDiag.version = 1;
++	gXpDiag.entryBytes = sizeof(XpCpuDiagEntry);
++	gXpDiag.capacity = 32;
++	clock_get_uptime(&gXpDiag.beginAbs);
++	mp_rendezvous_no_intrs(xpDiagOne, nullptr);
++	clock_get_uptime(&gXpDiag.endAbs);
++	const int error = SYSCTL_OUT(req, &gXpDiag, sizeof(gXpDiag));
++	IOLockUnlock(gXpDiagLock);
++	return error;
++}
++
+ SYSCTL_NODE(_debug, OID_AUTO, xepm, CTLFLAG_RW, 0, "NootedGreen XE-PM");
+ SYSCTL_PROC(_debug_xepm, OID_AUTO, sensors, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0, xpSensors, "S", "temperatures and RAPL energy");
++SYSCTL_PROC(_debug_xepm, OID_AUTO, cpu_diag, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0, xpCpuDiag, "S", "read-only per-CPU HWP and performance counters v1");
+ SYSCTL_INT(_debug_xepm, OID_AUTO, hwp, CTLFLAG_RW, &gXpHwp, 0, "HWP rescale on hybrid P-cores");
+ SYSCTL_INT(_debug_xepm, OID_AUTO, epp, CTLFLAG_RW, &gXpEpp, 0, "EPP override, -1 = XCPM's");
+ SYSCTL_INT(_debug_xepm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
+@@ -207,13 +391,91 @@ SYSCTL_INT(_debug_xepm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
+ SYSCTL_INT(_debug_xepm, OID_AUTO, route, CTLFLAG_RD, &gXpRoute, 0, "1 = HWP route installed");
+ SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_w, CTLFLAG_RD, &gXpPl1, 0, "requested PL1 (ngreenpmpl1)");
+ SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_set, CTLFLAG_RD, &gXpPl1Set, 0, "MCHBAR PL1 field after the write, -1 = locked");
++SYSCTL_INT(_debug_xepm, OID_AUTO, msr_pl1_antes, CTLFLAG_RD, &gXpMsrPl1Before, 0, "MSR 0x610 PL1 antes");
++SYSCTL_INT(_debug_xepm, OID_AUTO, msr_pl1, CTLFLAG_RD, &gXpMsrPl1, 0, "MSR 0x610 PL1 agora");
++SYSCTL_INT(_debug_xepm, OID_AUTO, msr_pl2, CTLFLAG_RD, &gXpMsrPl2, 0, "MSR 0x610 PL2");
++SYSCTL_INT(_debug_xepm, OID_AUTO, msr_lock, CTLFLAG_RD, &gXpMsrLock, 0, "MSR 0x610 travado");
++// T14: modo termico da Lenovo. 0x12B001 = desempenho, 0x1FF = reset (valores do thinkpad_acpi do Linux).
++static int gXpDytcLast = 0, gXpDytcRet = 0, gXpDytcErr = 0;
++static IOReturn xpDytc(uint32_t arg, uint32_t *out) {
++	OSDictionary *match = IOService::nameMatching("LEN0268");
++	if (!match) return kIOReturnNoMemory;
++	OSIterator *it = IOService::getMatchingServices(match);
++	match->release();
++	if (!it) return kIOReturnNotFound;
++	IOReturn result = kIOReturnNotFound;
++	while (auto *o = it->getNextObject()) {
++		auto *dev = OSDynamicCast(IOACPIPlatformDevice, o);
++		if (!dev) continue;
++		OSNumber *n = OSNumber::withNumber(arg, 32);
++		if (!n) { result = kIOReturnNoMemory; break; }
++		OSObject *params[1] = {n};
++		UInt32 value = 0;
++		result = dev->evaluateInteger("DYTC", &value, params, 1);
++		n->release();
++		if (result == kIOReturnSuccess && out) *out = value;
++		break;
++	}
++	it->release();
++	return result;
++}
++static int xpDytcCtl SYSCTL_HANDLER_ARGS {
++	uint32_t cur = 0;
++	gXpDytcErr = (int)xpDytc(2, &cur);   // DYTC_CMD_GET
++	int v = (int)cur;
++	int err = SYSCTL_OUT(req, &v, sizeof(v));
++	if (err || !req->newptr) return err;
++	if ((err = SYSCTL_IN(req, &v, sizeof(v)))) return err;
++	if (v != 0x12B001 && v != 0x1FF && v != 0x13B001) return EPERM;
++	uint32_t ret = 0;
++	gXpDytcErr = (int)xpDytc((uint32_t)v, &ret);
++	gXpDytcLast = v;
++	gXpDytcRet = (int)ret;
++	IOLog("XeNG PM: DYTC 0x%x -> err 0x%x ret 0x%x\n", v, gXpDytcErr, gXpDytcRet);
++	return 0;
++}
++SYSCTL_PROC(_debug_xepm, OID_AUTO, dytc, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpDytcCtl, "I", "Modo termico Lenovo: leitura DYTC(2); escrita so valores permitidos");
++SYSCTL_INT(_debug_xepm, OID_AUTO, dytc_ret, CTLFLAG_RD, &gXpDytcRet, 0, "Retorno do ultimo DYTC");
++SYSCTL_INT(_debug_xepm, OID_AUTO, dytc_err, CTLFLAG_RD, &gXpDytcErr, 0, "IOReturn do ultimo DYTC");
++SYSCTL_INT(_debug_xepm, OID_AUTO, dytc_boot_err, CTLFLAG_RD, &gXpDytcBootErr, 0, "IOReturn do DYTC no boot; -1 = nao rodou");
++static int xpPl1Live SYSCTL_HANDLER_ARGS {
++	if (req->newptr) return EPERM;
++	uint64_t raw = 0;
++	int error = xpReadMmio(&raw);
++	if (error) return error;
++	int v = (arg2 == 0) ? (int)(uint32_t)raw : (int)(uint32_t)(raw >> 32);
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_debug_xepm, OID_AUTO, mmio_lo, CTLTYPE_INT | CTLFLAG_RD, nullptr, 0, xpPl1Live, "I", "MCHBAR PL1 passive read v2");
++SYSCTL_PROC(_debug_xepm, OID_AUTO, mmio_hi, CTLTYPE_INT | CTLFLAG_RD, nullptr, 1, xpPl1Live, "I", "MCHBAR PL2 passive read v2");
++SYSCTL_INT(_debug_xepm, OID_AUTO, hold, CTLFLAG_RD, &gXpHold, 0, "Optional bounded power experiment active");
++SYSCTL_INT(_debug_xepm, OID_AUTO, hold_hot, CTLFLAG_RD, &gXpHoldHot, 0, "Thermal pause active; thresholds in trip_c and resume_c");
++SYSCTL_INT(_debug_xepm, OID_AUTO, hold_temp, CTLFLAG_RD, &gXpHoldTemp, 0, "Last package temperature, -1 invalid");
++SYSCTL_INT(_debug_xepm, OID_AUTO, poll_ms, CTLFLAG_RD, &gXpPollMs, 0, "Power-control sampling period in milliseconds");
++SYSCTL_INT(_debug_xepm, OID_AUTO, trip_c, CTLFLAG_RD, &gXpTripC, 0, "Thermal pause threshold");
++SYSCTL_INT(_debug_xepm, OID_AUTO, resume_c, CTLFLAG_RD, &gXpResumeC, 0, "Thermal resume threshold");
++static int xpMsrLo SYSCTL_HANDLER_ARGS {
++	int v = (int)(uint32_t)xpRdmsr((uint32_t)arg2);
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++static int xpMsrHi SYSCTL_HANDLER_ARGS {
++	int v = (int)(uint32_t)(xpRdmsr((uint32_t)arg2) >> 32);
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_debug_xepm, OID_AUTO, lim64f, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0x64F, xpMsrLo, "I", "IA_PERF_LIMIT_REASONS");
++SYSCTL_PROC(_debug_xepm, OID_AUTO, psys_lo, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0x65C, xpMsrLo, "I", "PLATFORM_POWER_LIMIT baixo");
++SYSCTL_PROC(_debug_xepm, OID_AUTO, psys_hi, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0x65C, xpMsrHi, "I", "PLATFORM_POWER_LIMIT alto");
+ 
+ void xePmInstall(KernelPatcher &patcher) {
+ 	int pmw = 0;   // ngreenpm=W: the profile plus PL1 = W watts (one boot-arg; -ngreenpm alone leaves PL1 alone)
+ 	const bool pmVal = PE_parse_boot_argn("ngreenpm", &pmw, sizeof(pmw));
++	gXpDiagLock = IOLockAlloc();
+ 	sysctl_register_oid(&sysctl__debug_xepm);           // the sensors are always there (menu-bar temperature tool)
+ 	sysctl_register_oid(&sysctl__debug_xepm_sensors);
++	sysctl_register_oid(&sysctl__debug_xepm_cpu_diag);
+ 	if (!checkKernelArgument("-ngreenpm") && !pmVal) return;
++	int dytcBoot = 0;
++	if (PE_parse_boot_argn("ngreenpmdytc", &dytcBoot, sizeof(dytcBoot)) && dytcBoot == 1) gXpDytcBoot = 1;
+ 	gXpOn = true;
+ 	int e = 0;
+ 	gXpEpp = (PE_parse_boot_argn("ngreenpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 0;
+@@ -222,6 +484,17 @@ void xePmInstall(KernelPatcher &patcher) {
+ 	int w = 0;
+ 	if (PE_parse_boot_argn("ngreenpmpl1", &w, sizeof(w)) && w >= 5 && w <= 64) gXpPl1 = w;
+ 	else if (pmVal && pmw >= 5 && pmw <= 64) gXpPl1 = pmw;
++	gXpPowerLock = IOLockAlloc();
++	// Explicit opt-in, constrained to a moderate PL1 and a 35 W turbo cap.
++	int hold = 0;
++	if (gXpPowerLock && PE_parse_boot_argn("ngreenpmhold", &hold, sizeof(hold)) && hold == 1 && gXpPl1 >= 5 && gXpPl1 <= 64) {
++		int poll = 2000, trip = 85, resume = 75;
++		if (PE_parse_boot_argn("ngreenpmpoll", &poll, sizeof(poll)) && poll >= 100 && poll <= 5000) gXpPollMs = poll;
++		if (PE_parse_boot_argn("ngreenpmtemp", &trip, sizeof(trip)) && trip >= 80 && trip <= 98) gXpTripC = trip;
++		if (PE_parse_boot_argn("ngreenpmresume", &resume, sizeof(resume)) && resume >= 60 && resume <= gXpTripC - 5) gXpResumeC = resume;
++		gXpHoldCall = thread_call_allocate(xpMaintain, nullptr);
++		if (gXpHoldCall) { gXpHold = 1; gXpPl2 = 35; int pl2 = 0; if (PE_parse_boot_argn("ngreenpmpl2", &pl2, sizeof(pl2)) && pl2 >= gXpPl1 && pl2 <= 64) gXpPl2 = pl2; }
++	}
+ 	gXpCstPtr = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_cstate_table");
+ 	patcher.clearError();
+ 	const mach_vm_address_t base = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_enable_pstate_ctrs");
+@@ -248,11 +521,34 @@ void xePmInstall(KernelPatcher &patcher) {
+ 	sysctl_register_oid(&sysctl__debug_xepm_route);
+ 	sysctl_register_oid(&sysctl__debug_xepm_pl1_w);
+ 	sysctl_register_oid(&sysctl__debug_xepm_pl1_set);
++	sysctl_register_oid(&sysctl__debug_xepm_msr_pl1_antes);
++	sysctl_register_oid(&sysctl__debug_xepm_msr_pl1);
++	sysctl_register_oid(&sysctl__debug_xepm_msr_pl2);
++	sysctl_register_oid(&sysctl__debug_xepm_msr_lock);
++	sysctl_register_oid(&sysctl__debug_xepm_dytc);
++	sysctl_register_oid(&sysctl__debug_xepm_dytc_ret);
++	sysctl_register_oid(&sysctl__debug_xepm_dytc_err);
++	sysctl_register_oid(&sysctl__debug_xepm_dytc_boot_err);
++	sysctl_register_oid(&sysctl__debug_xepm_mmio_lo);
++	sysctl_register_oid(&sysctl__debug_xepm_mmio_hi);
++	sysctl_register_oid(&sysctl__debug_xepm_hold);
++	sysctl_register_oid(&sysctl__debug_xepm_hold_hot);
++	sysctl_register_oid(&sysctl__debug_xepm_hold_temp);
++	sysctl_register_oid(&sysctl__debug_xepm_poll_ms);
++	sysctl_register_oid(&sysctl__debug_xepm_trip_c);
++	sysctl_register_oid(&sysctl__debug_xepm_resume_c);
++	sysctl_register_oid(&sysctl__debug_xepm_lim64f);
++	sysctl_register_oid(&sysctl__debug_xepm_psys_lo);
++	sysctl_register_oid(&sysctl__debug_xepm_psys_hi);
+ 	uint64_t dl;
+ 	thread_call_t t20 = thread_call_allocate(xpApply, nullptr), t60 = thread_call_allocate(xpApply, nullptr);
+ 	clock_interval_to_deadline(20, kSecondScale, &dl);
+ 	if (t20) thread_call_enter_delayed(t20, dl);
+ 	clock_interval_to_deadline(60, kSecondScale, &dl);
+ 	if (t60) thread_call_enter_delayed(t60, dl);
++	if (gXpHoldCall) {
++		clock_interval_to_deadline(22, kSecondScale, &dl);
++		thread_call_enter_delayed(gXpHoldCall, dl);
++	}
+ 	IOLog("XeNG PM: -ngreenpm, HWP route %d, idle table %s; profile in 20 s\n", gXpRoute, gXpCstPtr ? "found" : "missing");
+ }

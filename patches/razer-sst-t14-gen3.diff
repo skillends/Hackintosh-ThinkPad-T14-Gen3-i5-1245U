@@ -1,0 +1,152 @@
+diff --git a/dependencies.lock.json b/dependencies.lock.json
+index 0bc5ddd..07cad78 100644
+--- a/dependencies.lock.json
++++ b/dependencies.lock.json
+@@ -15,5 +15,8 @@
+     "bytes": 2679518,
+     "sha256": "8931e622b6d16a7052cb2c2dabe16be06963a34b747f19e6cda2bbe8bc7e2557"
+   },
+-  "dai_config_sha256": "f0d487e93ab56e79ee52f89b353330b8978e633ef143f3a1c3640d643bc9593f"
++  "dai_config_sha256": {
++    "0": "e80231810bd6dac9adfcb772b3d91099858c5ba4210854cae9f6f2f0391c06fb",
++    "1": "f0d487e93ab56e79ee52f89b353330b8978e633ef143f3a1c3640d643bc9593f"
++  }
+ }
+diff --git a/src/RazerMicAudio.hpp b/src/RazerMicAudio.hpp
+index e710246..aa66736 100644
+--- a/src/RazerMicAudio.hpp
++++ b/src/RazerMicAudio.hpp
+@@ -43,7 +43,7 @@ public:
+     IOReturn performAudioEngineStart() override;
+     IOReturn performAudioEngineStop() override;
+     UInt32 getCurrentSampleFrame() override;
+-    OSString *getGlobalUniqueID() override {return OSString::withCString("RazerSSTMicrophone:8086-51C8:1A58-3005:PDM1");}
++    OSString *getGlobalUniqueID() override {return OSString::withCString("RazerSSTMicrophone:8086-51C8:17AA-22E8:DMIC");}
+     IOReturn performFormatChange(IOAudioStream *,const IOAudioStreamFormat *,const IOAudioSampleRate *) override;
+     IOReturn convertInputSamples(const void *,void *,UInt32,UInt32,const IOAudioStreamFormat *,IOAudioStream *) override;
+     void prepareForSleep();
+diff --git a/src/RazerMicAudio.inc b/src/RazerMicAudio.inc
+index 8706bc0..0696532 100644
+--- a/src/RazerMicAudio.inc
++++ b/src/RazerMicAudio.inc
+@@ -11,8 +11,8 @@ IOWorkLoop *RazerMicAudioDevice::getWorkLoop() const {
+ }
+ bool RazerMicAudioDevice::initHardware(IOService *provider) {
+     if(!owner_ || !IOAudioDevice::initHardware(provider))return false;
+-    setDeviceName("Razer Internal Microphone");setDeviceShortName("Razer Mic");
+-    setManufacturerName("Razer Blade 17");setDeviceModelName("Blade 17 PDM1 Stereo Microphone");
++    setDeviceName("Microfone Interno T14");setDeviceShortName("Mic T14");
++    setManufacturerName("Lenovo ThinkPad T14 Gen 3");setDeviceModelName("T14 Gen 3 DMIC Stereo Microphone");
+     setDeviceTransportType(kIOAudioDeviceTransportTypeBuiltIn);
+     setDeviceCanBeDefault(kIOAudioDeviceCanBeDefaultInput);
+     engine_=new RazerMicAudioEngine;
+diff --git a/src/RazerSSTMicrophone.cpp b/src/RazerSSTMicrophone.cpp
+index 3420f85..5bd3737 100644
+--- a/src/RazerSSTMicrophone.cpp
++++ b/src/RazerSSTMicrophone.cpp
+@@ -329,7 +329,7 @@ bool RazerSSTMicrophone::bindPCI() {
+     if(it){while(OSObject *o=it->getNextObject()) {
+         auto *p=OSDynamicCast(IOPCIDevice,o);
+         if(p && p->configRead16(0)==0x8086 && p->configRead16(2)==0x51c8 &&
+-            p->configRead16(0x2c)==0x1a58 && p->configRead16(0x2e)==0x3005 &&
++            p->configRead16(0x2c)==0x17aa && p->configRead16(0x2e)==0x22e8 &&
+             p->getBusNumber()==0 && p->getDeviceNumber()==31 && p->getFunctionNumber()==3){pci_=p;p->retain();break;}
+     }it->release();}
+     if(!pci_)return fail("Exact PCI device absent");
+@@ -494,7 +494,7 @@ bool RazerSSTMicrophone::ipc(const void *msg,UInt32 size,const char *name) {
+     return true;
+ }
+ bool RazerSSTMicrophone::topology() {
+-    phase("ConfiguringPDM1MicrophonePipeline");
++    phase("ConfiguringDMICMicrophonePipeline");
+     UInt32 scheduler[]={48,0x30100000,30,3,35,0,1000,0,5000,0,0,1};
+     UInt32 buffer[]={44,0x30200000,31,12,3,0,0,9600,0x71,0,0};
+     UInt32 host[19]={};host[0]=76;host[1]=0x30010000;host[2]=35;host[3]=1;host[4]=3;host[7]=36;host[9]=2;host[10]=2;host[12]=2;host[16]=1;
+@@ -502,7 +502,7 @@ bool RazerSSTMicrophone::topology() {
+     UInt32 conn1[]={16,0x30030000,34,31},conn2[]={16,0x30030000,31,35},complete[]={12,0x30130000,30};
+     if(!ipc(scheduler,sizeof(scheduler),"PipelineCreate") || !ipc(buffer,sizeof(buffer),"BufferCreate") ||
+        !ipc(host,sizeof(host),"HostCreate") || !ipc(dai,sizeof(dai),"DMICCreate") ||
+-       !ipc(razer_dmic_dai,216,"DAIConfigPDM1") || !ipc(conn1,16,"ConnectDMICBuffer") ||
++       !ipc(razer_dmic_dai,216,"DAIConfigDMIC") || !ipc(conn1,16,"ConnectDMICBuffer") ||
+        !ipc(conn2,16,"ConnectBufferHost") || !ipc(complete,12,"PipelineComplete"))return false;
+     setProperty("MicrophonePipelineConfigured",true);return true;
+ }
+diff --git a/tests/test_dai.py b/tests/test_dai.py
+index dcb7e67..019a6e8 100644
+--- a/tests/test_dai.py
++++ b/tests/test_dai.py
+@@ -12,6 +12,7 @@ spec = importlib.util.spec_from_file_location("dai_generator", root / "tools/gen
+ generator = importlib.util.module_from_spec(spec)
+ spec.loader.exec_module(generator)
+ packet = generator.generate()
++pdm = __import__("json").loads((root / "hardware/thinkpad-t14-gen3.json").read_text())["capture"]["physical_pdm_controller"]
+ 
+ 
+ def u32(offset):
+@@ -20,7 +21,7 @@ def u32(offset):
+ 
+ assert len(packet) == 216 and u32(0) == len(packet)
+ assert u32(4) == 0x80010000 and u32(8) == 2
+-assert u32(12) == 0  # Logical DAI FIFO 0, distinct from physical PDM ID 1.
++assert u32(12) == 0  # Logical DAI FIFO 0, distinct from the physical PDM ID.
+ assert not any(packet[20:52])
+ assert u32(56) == 1
+ assert (u32(60), u32(64), u32(68)) == (2400000, 2400000, 48000)
+@@ -29,6 +30,6 @@ assert u32(84) == 1  # One physical controller with two enabled capsules.
+ assert (u32(88), u32(92), u32(96)) == (0, 0, 0)
+ assert not any(packet[100:120])
+ assert u32(120) == 0
+-assert struct.unpack_from("<7H", packet, 124) == (1, 1, 1, 0, 0, 0, 0)
++assert struct.unpack_from("<7H", packet, 124) == (pdm, 1, 1, 0, 0, 0, 0)
+ assert not any(packet[138:])
+-print("PASS: IPC3 DAI ABI; logical FIFO0 / physical PDM1 A+B; 48kHz stereo; exact 2.4MHz; reserved fields clear; no extra PDM controllers")
++print("PASS: IPC3 DAI ABI; logical FIFO0 / physical PDM%d A+B;" % pdm, " 48kHz stereo; exact 2.4MHz; reserved fields clear; no extra PDM controllers")
+diff --git a/tools/generate-dai.py b/tools/generate-dai.py
+index b3052ef..fe583fa 100755
+--- a/tools/generate-dai.py
++++ b/tools/generate-dai.py
+@@ -10,9 +10,10 @@ from common import ROOT, LOCK
+ 
+ 
+ def generate():
+-    c = json.loads((ROOT / "hardware/razer-blade17-2022.json").read_text())["capture"]
+-    if (c["physical_pdm_controller"], c["microphones"], c["channels"], c["sample_rate_hz"]) != (1, ["A", "B"], 2, 48000):
+-        raise ValueError("This generator only supports the tested PDM1 stereo configuration")
++    c = json.loads((ROOT / "hardware/thinkpad-t14-gen3.json").read_text())["capture"]
++    pdm = c["physical_pdm_controller"]
++    if pdm not in (0, 1) or (c["microphones"], c["channels"], c["sample_rate_hz"]) != (["A", "B"], 2, 48000):
++        raise ValueError("This generator only supports PDM0 or PDM1 A+B stereo")
+     clock = c["io_clock_hz"] // c["clock_divisor"]
+     if clock != c["pdm_clock_hz"] or clock != 2400000:
+         raise ValueError("Unexpected microphone clock")
+@@ -23,9 +24,9 @@ def generate():
+     struct.pack_into("<IIIIIIHHHHIIII", packet, 52,
+                      0, 1, clock, clock, c["sample_rate_hz"], 0,
+                      32, 32, c["duty_min_percent"], c["duty_max_percent"], 1, 0, 0, 0)
+-    struct.pack_into("<I10H", packet, 120, 0, 1, 1, 1, 0, 0,
++    struct.pack_into("<I10H", packet, 120, 0, pdm, 1, 1, 0, 0,
+                      c["clock_edge"], c["clock_skew"], 0, 0, 0)
+-    if hashlib.sha256(packet).hexdigest() != LOCK["dai_config_sha256"]:
++    if hashlib.sha256(packet).hexdigest() != LOCK["dai_config_sha256"][str(pdm)]:
+         raise ValueError("Generated DAI message differs from the hardware-tested bytes")
+     return bytes(packet)
+ 
+@@ -34,4 +35,4 @@ if __name__ == "__main__":
+     if len(sys.argv) != 2:
+         raise SystemExit("Usage: python3 tools/generate-dai.py OUTPUT.bin")
+     Path(sys.argv[1]).write_bytes(generate())
+-    print("Generated exact tested 216-byte PDM1 A+B IPC3 message.")
++    print("Generated 216-byte A+B IPC3 message from hardware/thinkpad-t14-gen3.json.")
+diff --git a/tools/mic-input-check.c b/tools/mic-input-check.c
+index cf72c36..e1e9173 100644
+--- a/tools/mic-input-check.c
++++ b/tools/mic-input-check.c
+@@ -60,7 +60,7 @@ static AudioDeviceID find(void){
+         CFStringRef uid=NULL;UInt32 size=sizeof uid;
+         address=(AudioObjectPropertyAddress){kAudioDevicePropertyDeviceUID,kAudioObjectPropertyScopeGlobal,kAudioObjectPropertyElementMain};
+         if(!AudioObjectGetPropertyData(devices[n],&address,0,NULL,&size,&uid) && uid){
+-            if(CFEqual(uid,CFSTR("RazerSSTMicrophone:8086-51C8:1A58-3005:PDM1")))found=devices[n];CFRelease(uid);
++            if(CFEqual(uid,CFSTR("RazerSSTMicrophone:8086-51C8:17AA-22E8:DMIC")))found=devices[n];CFRelease(uid);
+         }
+     }
+     free(devices);return found;
