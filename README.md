@@ -47,7 +47,11 @@ Geekbench 7, CPU, na mesma máquina:
 |---|---|---|
 | Windows | 1963 | 7270 |
 | macOS, início | 1334 | 3968 |
-| **macOS, configuração atual** | **1676** | **5795** |
+| macOS, CPUFriend + modo desempenho Lenovo | 1676 | 5795 |
+| **macOS, configuração atual** | **1811** | **7252** |
+
+A configuração atual soma `ctrsmt=full` (topologia) e o HWP autônomo (`ngreenpmauto=1`). Com 1 tarefa, a mediana do
+clock foi de 3,0 para 3,95 GHz; no Windows é 4,0 GHz. A GPU trabalha a 1.150–1.200 MHz (máximo 1.200).
 
 Geekbench Metal registrado no início do projeto: 1635.
 
@@ -60,6 +64,9 @@ Geekbench Metal registrado no início do projeto: 1635.
 - **Queda de energia:** sem os drivers térmicos do Windows, o limite de energia oscilava. O kext aciona o modo
   desempenho da Lenovo (`DYTC 0x12B001`) e mantém os limites.
 - **Plano de frequência:** CPUFriend com o plano do iMac20,1, gerado a partir do próprio sistema.
+- **HWP autônomo:** o XCPM escolhia a frequência por software a cada 3 ms, às vezes 1,3 GHz. Com `ngreenpmauto=1`, o
+  processador decide sozinho, como no Windows. Liga e desliga ao vivo com `sudo sysctl -w debug.xepm.hwp_auto=1` ou `=0`.
+- **Topologia:** `ctrsmt=full` no CpuTopologyRebuild deu +14% no multi.
 - **Microfone:** adaptação de um driver SOF para o subsistema do T14, usando `PDM0`.
 
 Detalhes em [docs/DESCOBERTAS.md](docs/DESCOBERTAS.md). As alterações estão em [patches](patches).

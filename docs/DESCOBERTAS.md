@@ -18,6 +18,16 @@ hipótese é o firmware da Lenovo sem os drivers térmicos do Windows.
 - `cpus=4`, só com os núcleos de desempenho, ainda mostrou clock oscilando. Os núcleos de eficiência não explicam tudo.
 - CPUFriend com o plano do iMac20,1 eliminou as quedas perto de 1 GHz na medição e levou a 1676 / 5795.
 - Com 64 W, o limite no multi passou a ser térmico, chegando a 98 °C. O Windows também chegou a 100 °C.
+- No Windows (HWiNFO), com 1 tarefa, os núcleos P ficam em 4,0–4,4 GHz e os E em 3,3 GHz.
+- O XCPM grava em `IA32_HWP_REQUEST` um "desired" escolhido por ele (de 13 a 44 entre os núcleos, ou 1,3 a 4,4 GHz) e
+  trocou a razão quase 1 milhão de vezes desde o boot. Zerando o desired (HWP autônomo, `debug.xepm.hwp_auto`), a
+  mediana de 1 tarefa foi de 3,0 para 3,95 GHz, e o Geekbench de 1634 / 6597 para 1811 / 7252.
+- `ctrsmt=full` sozinho levou de 1676 / 5795 para 1634 / 6597: multi +14%, single igual.
+- Com o CpuTopologyRebuild, o trabalho de fundo (WindowServer, kernel) fica na primeira thread dos núcleos P e os E
+  quase parados. O kernel_task gasta 15–28% de CPU com a máquina quase parada; a causa não foi investigada.
+- A leitura `debug.xepm.gpu` mostrou RP0 1.200 MHz, a GPU a 1.150–1.200 MHz quando trabalha e 81% do tempo em repouso
+  (RC6) parada. O piso de frequência (XE-GTFREQ) funciona neste modelo.
+- A leitura `debug.xepm.sensors` (usada por `sensores.py`) travou duas vezes num mesmo boot; a causa não foi investigada.
 
 ## HDMI
 

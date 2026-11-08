@@ -12,7 +12,7 @@ index e291589..6b72bc7 100755
  		<string>1.0.0b1</string>
  		<key>com.apple.kpi.bsd</key>
 diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
-index 53d4288..38ab51e 100755
+index 53d4288..542311a 100755
 --- a/src/NootedGreen/kern_gen11.cpp
 +++ b/src/NootedGreen/kern_gen11.cpp
 @@ -10,6 +10,7 @@ static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
@@ -420,8 +420,28 @@ index 53d4288..38ab51e 100755
  	// Diagnóstico sobrevivente (o log do kernel é varrido pelo spam de AUX): a entrada ativa é escolhida pela
  	// getOSInformation original e guardada em controller+0xd40. Lemos con1 de LÁ (é a struct que cria as portas),
  	// reforçamos os campos do HDMI, e publicamos no IORegistry p/ o relatório ler com ioreg a qualquer momento.
+@@ -8657,6 +8912,19 @@ void Gen11::wrapSetGTFrequencyMMIO(void *that, uint32_t val)
+ // IOFBSetDisplayModeAndDepth -> IntelAccelerator::stopGraphicsEngine -> IGScheduler5::waitForGpuIdle (até 25000 x 100 us),
+ // chamado várias vezes, com stamps que nunca retornam. Se uma espera esgota (>= 2 s), as esperas dos próximos 30 s
+ // retornam na hora (a marca expira, para não afetar o uso normal). -ngreennoidlebound desliga.
++// T14 (08/11): leitura para debug.xepm.gpu (kern_xepm.cpp). So leitura de MMIO, faixa sem forcewake:
++// RPSTAT1 0x1381b4 (CAGF bits 19:11, x 50/3 MHz), RP_STATE_CAP (RP0 7:0, RP1 15:8, RPn 23:16, x 50/3 MHz),
++// RC6 0x138108 (contador de 1,28 us), ultimo pedido da Apple em setGTFrequencyMMIO e numero de pedidos.
++bool xeGpuSnapshot(uint32_t out[8]) {
++	if (!NGreen::callback) return false;
++	out[0] = 1;
++	out[1] = NGreen::callback->readReg32(0x1381b4);
++	out[2] = NGreen::callback->readReg32(GEN6_RP_STATE_CAP);
++	out[3] = NGreen::callback->readReg32(0x138108);
++	out[4] = gXeGtFreqApple;
++	out[5] = gXeGtFreqN;
++	return true;
++}
+ static volatile uint64_t gXeWedgedUntil = 0; static volatile uint32_t gXeIdleSkips = 0;
+ void Gen11::wrapWaitForGpuIdle(void *that)
+ {
 diff --git a/src/NootedGreen/kern_xepm.cpp b/src/NootedGreen/kern_xepm.cpp
-index 6df9d5a..8a76351 100644
+index 6df9d5a..72aa177 100644
 --- a/src/NootedGreen/kern_xepm.cpp
 +++ b/src/NootedGreen/kern_xepm.cpp
 @@ -26,8 +26,11 @@
@@ -436,7 +456,29 @@ index 6df9d5a..8a76351 100644
  
  extern "C" void mp_rendezvous_no_intrs(void (*fn)(void *), void *arg);
  extern "C" int cpu_number(void);
-@@ -115,9 +118,28 @@ static int xpD3() {
+@@ -37,6 +40,10 @@ static inline void xpWrmsr(uint32_t m, uint64_t v) { asm volatile("wrmsr" : : "c
+ 
+ static bool gXpOn = false;
+ static int gXpHwp = 0, gXpEpp = -1;                 // sysctl debug.xepm.hwp / .epp (root)
++// T14 (08/11): debug.xepm.hwp_auto (root, ao vivo; boot-arg ngreenpmauto=1): desired 0 no IA32_HWP_REQUEST, o HWP
++// escolhe a frequencia sozinho como no Windows. debug.xepm.hwp_last: ultimo pedido do XCPM e o gravado, por CPU.
++static int gXpAuto = 0;
++static uint64_t gXpReqLast[64];   // [c] = pedido do XCPM, [32 + c] = valor gravado
+ static int gXpEet = 0, gXpCst = 0, gXpD3 = 0, gXpRoute = 0;   // status
+ static mach_vm_address_t gXpOrgSetMult = 0, gXpCstPtr = 0;
+ static bool gXpCstWant = true;   // ngreenpmcst=0 keeps XCPM's idle table (coil whine from deep C-state transitions)
+@@ -56,7 +63,10 @@ static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3)
+ 			nv = (nv & ~0xFFFF00ULL) | ((uint64_t)hi << 8) | ((uint64_t)d << 16);
+ 		}
+ 		if (gXpEpp >= 0) nv = (nv & ~0xFF000000ULL) | ((uint64_t)gXpEpp << 24);
++		if (gXpAuto) nv &= ~0xFF0000ULL;   // desired 0 = autonomo
+ 		if (nv != v) xpWrmsr(0x774, nv);
++		const int c = cpu_number();
++		if (c >= 0 && c < 32) { gXpReqLast[c] = v; gXpReqLast[32 + c] = nv; }
+ 	}
+ 	return r;
+ }
+@@ -115,9 +125,28 @@ static int xpD3() {
  }
  
  // ─── 6: MCHBAR PL1 ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -466,7 +508,7 @@ index 6df9d5a..8a76351 100644
  	uint64_t mch = 0;
  	OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
  	if (!it) return;
-@@ -132,14 +154,42 @@ static void xpPl1() {
+@@ -132,14 +161,42 @@ static void xpPl1() {
  	it->release();
  	if (!mch) return;
  	const uint32_t unit = (uint32_t)(xpRdmsr(0x606) & 0xF);   // power unit 1/2^n W (3 -> 1/8 W)
@@ -511,7 +553,7 @@ index 6df9d5a..8a76351 100644
  			gXpPl1Set = (int)(*lo & 0x7FFF);
  		} else gXpPl1Set = -1;
  		mm->release();
-@@ -147,8 +197,55 @@ static void xpPl1() {
+@@ -147,8 +204,55 @@ static void xpPl1() {
  	md->release();
  }
  
@@ -567,7 +609,7 @@ index 6df9d5a..8a76351 100644
  	gXpCst = xpCstFix();
  	gXpD3 += xpD3();
  	if (!gXpEet) { mp_rendezvous_no_intrs(xpEetOne, nullptr); gXpEet = (int)((xpRdmsr(0x1FC) >> 19) & 1); }
-@@ -188,8 +285,95 @@ static int xpSensors SYSCTL_HANDLER_ARGS {
+@@ -188,11 +292,113 @@ static int xpSensors SYSCTL_HANDLER_ARGS {
  	return SYSCTL_OUT(req, &gXpSens, sizeof(gXpSens));
  }
  
@@ -663,7 +705,25 @@ index 6df9d5a..8a76351 100644
  SYSCTL_INT(_debug_xepm, OID_AUTO, hwp, CTLFLAG_RW, &gXpHwp, 0, "HWP rescale on hybrid P-cores");
  SYSCTL_INT(_debug_xepm, OID_AUTO, epp, CTLFLAG_RW, &gXpEpp, 0, "EPP override, -1 = XCPM's");
  SYSCTL_INT(_debug_xepm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
-@@ -207,13 +391,91 @@ SYSCTL_INT(_debug_xepm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
++SYSCTL_INT(_debug_xepm, OID_AUTO, hwp_auto, CTLFLAG_RW, &gXpAuto, 0, "1 = HWP autonomo (desired 0)");
++static int xpHwpLast SYSCTL_HANDLER_ARGS {
++	if (req->newptr) return EPERM;
++	return SYSCTL_OUT(req, gXpReqLast, sizeof(gXpReqLast));
++}
++SYSCTL_PROC(_debug_xepm, OID_AUTO, hwp_last, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0, xpHwpLast, "S", "ultimo HWP_REQUEST por CPU: XCPM e gravado");
++// T14 (08/11): GPU (kern_gen11.cpp). So leitura de MMIO, sem chamada entre CPUs.
++bool xeGpuSnapshot(uint32_t out[8]);
++static int xpGpu SYSCTL_HANDLER_ARGS {
++	if (req->newptr) return EPERM;
++	uint32_t v[8] = {};
++	if (!xeGpuSnapshot(v)) return ENOENT;
++	return SYSCTL_OUT(req, v, sizeof(v));
++}
++SYSCTL_PROC(_debug_xepm, OID_AUTO, gpu, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0, xpGpu, "S", "RPSTAT1, RP_STATE_CAP, RC6, pedido da Apple");
+ static int xpCstCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.xepm.cst=0|1 (live)
+ 	int v = gXpCst;
+ 	int err = SYSCTL_OUT(req, &v, sizeof(v));
+@@ -207,21 +413,113 @@ SYSCTL_INT(_debug_xepm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
  SYSCTL_INT(_debug_xepm, OID_AUTO, route, CTLFLAG_RD, &gXpRoute, 0, "1 = HWP route installed");
  SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_w, CTLFLAG_RD, &gXpPl1, 0, "requested PL1 (ngreenpmpl1)");
  SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_set, CTLFLAG_RD, &gXpPl1Set, 0, "MCHBAR PL1 field after the write, -1 = locked");
@@ -749,13 +809,17 @@ index 6df9d5a..8a76351 100644
  	sysctl_register_oid(&sysctl__debug_xepm);           // the sensors are always there (menu-bar temperature tool)
  	sysctl_register_oid(&sysctl__debug_xepm_sensors);
 +	sysctl_register_oid(&sysctl__debug_xepm_cpu_diag);
++	sysctl_register_oid(&sysctl__debug_xepm_gpu);
  	if (!checkKernelArgument("-ngreenpm") && !pmVal) return;
 +	int dytcBoot = 0;
 +	if (PE_parse_boot_argn("ngreenpmdytc", &dytcBoot, sizeof(dytcBoot)) && dytcBoot == 1) gXpDytcBoot = 1;
  	gXpOn = true;
  	int e = 0;
  	gXpEpp = (PE_parse_boot_argn("ngreenpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 0;
-@@ -222,6 +484,17 @@ void xePmInstall(KernelPatcher &patcher) {
++	int au = 0;
++	if (PE_parse_boot_argn("ngreenpmauto", &au, sizeof(au)) && au == 1) gXpAuto = 1;
+ 	int cw = 1;
+ 	if (PE_parse_boot_argn("ngreenpmcst", &cw, sizeof(cw))) gXpCstWant = cw != 0;
  	int w = 0;
  	if (PE_parse_boot_argn("ngreenpmpl1", &w, sizeof(w)) && w >= 5 && w <= 64) gXpPl1 = w;
  	else if (pmVal && pmw >= 5 && pmw <= 64) gXpPl1 = pmw;
@@ -773,7 +837,14 @@ index 6df9d5a..8a76351 100644
  	gXpCstPtr = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_cstate_table");
  	patcher.clearError();
  	const mach_vm_address_t base = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_enable_pstate_ctrs");
-@@ -248,11 +521,34 @@ void xePmInstall(KernelPatcher &patcher) {
+@@ -243,16 +541,41 @@ void xePmInstall(KernelPatcher &patcher) {
+ 	sysctl_register_oid(&sysctl__debug_xepm_hwp);
+ 	sysctl_register_oid(&sysctl__debug_xepm_epp);
+ 	sysctl_register_oid(&sysctl__debug_xepm_eet_off);
++	sysctl_register_oid(&sysctl__debug_xepm_hwp_auto);
++	sysctl_register_oid(&sysctl__debug_xepm_hwp_last);
+ 	sysctl_register_oid(&sysctl__debug_xepm_cst);
+ 	sysctl_register_oid(&sysctl__debug_xepm_d3);
  	sysctl_register_oid(&sysctl__debug_xepm_route);
  	sysctl_register_oid(&sysctl__debug_xepm_pl1_w);
  	sysctl_register_oid(&sysctl__debug_xepm_pl1_set);

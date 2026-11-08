@@ -1412,7 +1412,7 @@
 				AAAAAAAAAAAAAAAAAAA=
 				</data>
 				<key>boot-args</key>
-				<string>IGLogLevel=3 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode ngreenlv=1 ngreenSched=4 ngreenV142=3 gfxrst=1 ngreenpm=64 ngreen-eu=80 ngreen-l3=6 debug=0x100 -vi2c-force-polling keepsyms=1 ngreenhdmiaux=1 ngreenhdmisink=1 ngreenhdmiflags=0x202 ngreenhdmiddc=1 ngreenhdmilight=2 ngreenpmhold=1 ngreenpmpoll=250 ngreenpmtemp=98 ngreenpmresume=90 ngreenhdmibaseonly=1 ngreenpmdytc=1 ngreenpmpl2=64</string>
+				<string>IGLogLevel=3 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode ngreenlv=1 ngreenSched=4 ngreenV142=3 gfxrst=1 ngreenpm=64 ngreen-eu=80 ngreen-l3=6 debug=0x100 -vi2c-force-polling keepsyms=1 ngreenhdmiaux=1 ngreenhdmisink=1 ngreenhdmiflags=0x202 ngreenhdmiddc=1 ngreenhdmilight=2 ngreenpmhold=1 ngreenpmpoll=250 ngreenpmtemp=98 ngreenpmresume=90 ngreenhdmibaseonly=1 ngreenpmdytc=1 ngreenpmpl2=64 ctrsmt=full ngreenpmauto=1</string>
 				<key>csr-active-config</key>
 				<data>
 				EwoAAA==
